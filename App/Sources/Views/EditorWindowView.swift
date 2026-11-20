@@ -7,7 +7,7 @@ struct EditorWindowView: View {
     @Environment(\.undoManager) private var envUndoManager
     @Environment(\.openWindow) private var openWindow
 
-    @State private var model = EditorModel()
+    @State private var model: EditorModel
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var isInspectorPresented: Bool = true
     @State private var showTray: Bool = true
@@ -15,6 +15,10 @@ struct EditorWindowView: View {
     @State private var hostWindow: NSWindow?
 
     private let workspace = Workspace.shared
+
+    init(editorID: UUID) {
+        _model = State(initialValue: Workspace.shared.resolveEditor(id: editorID))
+    }
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
@@ -37,7 +41,8 @@ struct EditorWindowView: View {
         .toolbar {
             ToolbarItemGroup(placement: .navigation) {
                 Button {
-                    openWindow(id: RecorteApp.editorWindowID)
+                    let editor = workspace.createEditor()
+                    openWindow(id: RecorteApp.editorWindowID, value: editor.id)
                 } label: {
                     Label("New Tab", systemImage: "plus")
                 }
@@ -152,26 +157,29 @@ struct EditorWindowView: View {
             CollageSheetView(model: model, workspace: workspace)
         }
         .navigationTitle(model.title)
-        .frame(minWidth: 960, minHeight: 640)
+        .frame(minWidth: 800, minHeight: 600)
         .background(
-            WindowTabbingBridge(title: model.title) { window in
+            WindowTabbingBridge(editorID: model.id, title: model.title) { window in
                 hostWindow = window
             }
         )
         .focusedSceneValue(\.activeEditorModel, model)
         .onAppear {
+            workspace.hasAttachedWindow = true
+            let openWindowAction = openWindow
+            workspace.onRequestOpenTab = { id in
+                openWindowAction(id: RecorteApp.editorWindowID, value: id)
+            }
             if let envUndoManager {
                 model.undoManager = envUndoManager
             }
             workspace.register(model)
+            workspace.drainUnclaimedTabs()
         }
         .onChange(of: envUndoManager) { _, newUndo in
             if let newUndo {
                 model.undoManager = newUndo
             }
-        }
-        .onDisappear {
-            workspace.unregister(id: model.id)
         }
         .background(
             SingleKeyShortcutBridge(model: model, hostWindow: hostWindow)
@@ -180,7 +188,7 @@ struct EditorWindowView: View {
 
     private func pasteFromClipboard() {
         do {
-            try model.pasteFromPasteboard()
+            try workspace.pasteFromPasteboard(preferredEditor: model)
         } catch {
             model.lastErrorMessage = "No image found on the clipboard."
         }
@@ -188,48 +196,237 @@ struct EditorWindowView: View {
 
     private func openImageOrProjectFile() {
         ExportPanelController.presentOpenPanel(allowProjects: true) { urls in
-            for url in urls {
-                do {
-                    try model.openFile(from: url)
-                } catch {
-                    model.lastErrorMessage = "Could not open \(url.lastPathComponent)."
-                }
-            }
+            _ = workspace.openFiles(at: urls, preferredEditor: model)
         }
     }
 }
 
-// MARK: - Native NSWindow Tabbing Bridge (S4)
+// MARK: - Native NSWindow Tabbing Coordinator & Bridge (S4)
 
-private struct WindowTabbingBridge: NSViewRepresentable {
+@MainActor
+final class WindowTabCoordinator {
+    static let shared = WindowTabCoordinator()
     static let tabbingIdentifier = "dev.recorte.editor.tabgroup"
 
+    private final class WeakWindowBox {
+        weak var window: NSWindow?
+        init(_ window: NSWindow) {
+            self.window = window
+        }
+    }
+
+    private var windowsByEditorID: [UUID: WeakWindowBox] = [:]
+    private var lastActiveEditorID: UUID?
+    private var mergedWindowIDs: Set<ObjectIdentifier> = []
+
+    func window(for editorID: UUID) -> NSWindow? {
+        pruneDeadWindows()
+        return windowsByEditorID[editorID]?.window
+    }
+
+    func configureForTabbing(_ window: NSWindow, title: String) {
+        NSWindow.allowsAutomaticWindowTabbing = true
+        window.tabbingMode = .preferred
+        window.tabbingIdentifier = Self.tabbingIdentifier
+        window.title = title
+    }
+
+    func registerAndMergeIfNeeded(window: NSWindow, editorID: UUID, title: String) {
+        guard !window.isSheet, window.parent == nil, !(window is NSPanel) else { return }
+        pruneDeadWindows()
+        configureForTabbing(window, title: title)
+        windowsByEditorID[editorID] = WeakWindowBox(window)
+
+        let windowKey = ObjectIdentifier(window)
+        guard !mergedWindowIDs.contains(windowKey) else { return }
+        mergedWindowIDs.insert(windowKey)
+
+        if let host = preferredTabHostWindow(excluding: window) {
+            let targetHost = host.tabGroup?.selectedWindow ?? host
+            if targetHost !== window, window.tabGroup !== targetHost.tabGroup {
+                targetHost.addTabbedWindow(window, ordered: .above)
+                window.makeKeyAndOrderFront(nil)
+            }
+        }
+    }
+
+    func windowDidBecomeActive(editorID: UUID) {
+        lastActiveEditorID = editorID
+        Workspace.shared.markActive(id: editorID)
+    }
+
+    func windowWillClose(_ window: NSWindow, editorID: UUID) {
+        mergedWindowIDs.remove(ObjectIdentifier(window))
+        windowsByEditorID.removeValue(forKey: editorID)
+        if lastActiveEditorID == editorID {
+            lastActiveEditorID = nil
+        }
+        Workspace.shared.unregister(id: editorID)
+    }
+
+    private func preferredTabHostWindow(excluding candidate: NSWindow) -> NSWindow? {
+        if let lastID = lastActiveEditorID,
+           let lastWindow = windowsByEditorID[lastID]?.window,
+           lastWindow !== candidate,
+           isEligibleTabHost(lastWindow) {
+            return lastWindow
+        }
+
+        if let main = NSApp.mainWindow,
+           main !== candidate,
+           main.tabbingIdentifier == Self.tabbingIdentifier,
+           isEligibleTabHost(main) {
+            return main
+        }
+
+        for box in windowsByEditorID.values {
+            if let existing = box.window,
+               existing !== candidate,
+               isEligibleTabHost(existing) {
+                return existing
+            }
+        }
+        return nil
+    }
+
+    private func isEligibleTabHost(_ window: NSWindow) -> Bool {
+        guard !window.isSheet, window.parent == nil, !(window is NSPanel) else { return false }
+        if window.isVisible { return true }
+        return window.tabGroup?.windows.contains(where: { $0.isVisible }) ?? false
+    }
+
+    private func pruneDeadWindows() {
+        windowsByEditorID = windowsByEditorID.filter { $0.value.window != nil }
+    }
+}
+
+private struct WindowTabbingBridge: NSViewRepresentable {
+    let editorID: UUID
     let title: String
     let onWindowAttached: @MainActor (NSWindow) -> Void
 
+    func makeCoordinator() -> Coordinator {
+        Coordinator(editorID: editorID, title: title, onWindowAttached: onWindowAttached)
+    }
+
     func makeNSView(context: Context) -> NSView {
-        let view = NSView()
-        DispatchQueue.main.async {
-            attach(view: view)
+        let view = WindowObserverView()
+        let coordinator = context.coordinator
+        view.onWindowChanged = { [weak coordinator] window in
+            coordinator?.attach(to: window)
         }
         return view
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
-        DispatchQueue.main.async {
-            attach(view: nsView)
-            nsView.window?.title = title
+        context.coordinator.editorID = editorID
+        context.coordinator.title = title
+        context.coordinator.onWindowAttached = onWindowAttached
+        if let window = nsView.window {
+            context.coordinator.attach(to: window)
+            window.title = title
         }
     }
 
+    static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
+        coordinator.removeObservers()
+    }
+
     @MainActor
-    private func attach(view: NSView) {
-        guard let window = view.window else { return }
-        NSWindow.allowsAutomaticWindowTabbing = true
-        window.tabbingMode = .preferred
-        window.tabbingIdentifier = Self.tabbingIdentifier
-        window.title = title
-        onWindowAttached(window)
+    final class Coordinator {
+        var editorID: UUID
+        var title: String
+        var onWindowAttached: @MainActor (NSWindow) -> Void
+
+        private weak var observedWindow: NSWindow?
+        private var observers: [NSObjectProtocol] = []
+
+        init(editorID: UUID, title: String, onWindowAttached: @escaping @MainActor (NSWindow) -> Void) {
+            self.editorID = editorID
+            self.title = title
+            self.onWindowAttached = onWindowAttached
+        }
+
+        func attach(to window: NSWindow?) {
+            guard let window else { return }
+            WindowTabCoordinator.shared.configureForTabbing(window, title: title)
+
+            if observedWindow !== window {
+                removeObservers()
+                observedWindow = window
+                installObservers(for: window)
+                onWindowAttached(window)
+
+                DispatchQueue.main.async { [weak self, weak window] in
+                    guard let self, let window else { return }
+                    WindowTabCoordinator.shared.registerAndMergeIfNeeded(
+                        window: window,
+                        editorID: self.editorID,
+                        title: self.title
+                    )
+                    if window.isKeyWindow || window.isMainWindow {
+                        WindowTabCoordinator.shared.windowDidBecomeActive(editorID: self.editorID)
+                    }
+                }
+            }
+        }
+
+        private func installObservers(for window: NSWindow) {
+            let center = NotificationCenter.default
+
+            let keyObserver = center.addObserver(
+                forName: NSWindow.didBecomeKeyNotification,
+                object: window,
+                queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    WindowTabCoordinator.shared.windowDidBecomeActive(editorID: self.editorID)
+                }
+            }
+
+            let mainObserver = center.addObserver(
+                forName: NSWindow.didBecomeMainNotification,
+                object: window,
+                queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    WindowTabCoordinator.shared.windowDidBecomeActive(editorID: self.editorID)
+                }
+            }
+
+            let closeObserver = center.addObserver(
+                forName: NSWindow.willCloseNotification,
+                object: window,
+                queue: .main
+            ) { [weak self, weak window] _ in
+                MainActor.assumeIsolated {
+                    guard let self, let window else { return }
+                    WindowTabCoordinator.shared.windowWillClose(window, editorID: self.editorID)
+                }
+            }
+
+            observers = [keyObserver, mainObserver, closeObserver]
+        }
+
+        func removeObservers() {
+            let center = NotificationCenter.default
+            for observer in observers {
+                center.removeObserver(observer)
+            }
+            observers.removeAll()
+            observedWindow = nil
+        }
+    }
+}
+
+private final class WindowObserverView: NSView {
+    var onWindowChanged: (@MainActor (NSWindow?) -> Void)?
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        onWindowChanged?(window)
     }
 }
 

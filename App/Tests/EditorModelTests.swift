@@ -497,4 +497,183 @@ struct EditorModelTests {
         #expect(model.document.layers.count == 4)
         #expect(model.document.canvasSize == CGSize(width: 600, height: 600))
     }
+
+    @Test("Bug 1: Paste into empty Untitled document fills it in place instead of opening a second window")
+    func workspacePasteFillsEmptyDocumentWithoutOpeningNewTab() throws {
+        let workspace = Workspace()
+        workspace.hasAttachedWindow = true
+        var openedTabIDs: [UUID] = []
+        workspace.onRequestOpenTab = { id in
+            openedTabIDs.append(id)
+        }
+
+        let emptyEditor = workspace.createEditor()
+        #expect(emptyEditor.isEmpty)
+        #expect(emptyEditor.title == "Untitled")
+
+        let pasteboard = NSPasteboard.withUniqueName()
+        let firstImage = makeSolidImage(width: 220, height: 140, r: 40, g: 160, b: 220)
+        #expect(Clipboard.copy(firstImage, to: pasteboard))
+
+        // First paste into empty document fills it in place
+        let pastedEditor = try workspace.pasteFromPasteboard(pasteboard)
+        #expect(pastedEditor.id == emptyEditor.id)
+        #expect(workspace.editors.count == 1)
+        #expect(openedTabIDs.isEmpty)
+        #expect(!emptyEditor.isEmpty)
+        #expect(emptyEditor.document.canvasSize == CGSize(width: 220, height: 140))
+        #expect(emptyEditor.document.layers.count == 1)
+        #expect(emptyEditor.title == "Clipboard")
+
+        // Second paste into non-empty document adds a layer in place
+        let secondImage = makeSolidImage(width: 60, height: 40, r: 220, g: 80, b: 40)
+        #expect(Clipboard.copy(secondImage, to: pasteboard))
+        let secondPasted = try workspace.pasteFromPasteboard(pasteboard)
+        #expect(secondPasted.id == emptyEditor.id)
+        #expect(workspace.editors.count == 1)
+        #expect(openedTabIDs.isEmpty)
+        #expect(emptyEditor.document.layers.count == 2)
+
+        // New Tab explicitly creates a new empty document and requests a tab
+        let newTab = workspace.openNewTab()
+        #expect(workspace.editors.count == 2)
+        #expect(openedTabIDs == [newTab.id])
+        #expect(newTab.isEmpty)
+        #expect(workspace.activeEditorID == newTab.id)
+    }
+
+    @Test("Bug 1: Paste when all windows are closed creates a document and requests a tab")
+    func workspacePasteWhenNoEditorsOpenCreatesTab() throws {
+        let workspace = Workspace()
+        workspace.hasAttachedWindow = true
+        var openedTabIDs: [UUID] = []
+        workspace.onRequestOpenTab = { id in
+            openedTabIDs.append(id)
+        }
+
+        let pasteboard = NSPasteboard.withUniqueName()
+        let img = makeSolidImage(width: 150, height: 100, r: 10, g: 200, b: 100)
+        #expect(Clipboard.copy(img, to: pasteboard))
+
+        let created = try workspace.pasteFromPasteboard(pasteboard)
+        #expect(workspace.editors.count == 1)
+        #expect(openedTabIDs == [created.id])
+        #expect(created.document.canvasSize == CGSize(width: 150, height: 100))
+        #expect(created.document.layers.count == 1)
+    }
+
+    @Test("Bug 2: Opening an image file reuses an empty current document, else opens in a new tab")
+    func workspaceOpenFilesReusesEmptyThenOpensNewTab() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RecorteOpenFileTest-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let file1 = tempDir.appendingPathComponent("sunset.png")
+        let file2 = tempDir.appendingPathComponent("portrait.png")
+        try ImageExporter.export(makeSolidImage(width: 200, height: 120, r: 240, g: 100, b: 40), to: file1, format: .png)
+        try ImageExporter.export(makeSolidImage(width: 80, height: 110, r: 40, g: 120, b: 240), to: file2, format: .png)
+
+        // Warm launch: empty current document should be reused
+        let workspace = Workspace()
+        workspace.hasAttachedWindow = true
+        var openedTabIDs: [UUID] = []
+        workspace.onRequestOpenTab = { id in
+            openedTabIDs.append(id)
+        }
+
+        let emptyEditor = workspace.createEditor()
+        let firstOpened = workspace.openFiles(at: [file1])
+        #expect(firstOpened.count == 1)
+        #expect(firstOpened[0].id == emptyEditor.id)
+        #expect(workspace.editors.count == 1)
+        #expect(openedTabIDs.isEmpty)
+        #expect(emptyEditor.title == "sunset")
+        #expect(emptyEditor.document.canvasSize == CGSize(width: 200, height: 120))
+        #expect(emptyEditor.document.layers.count == 1)
+
+        // Non-empty current document: second file opens in a new tab without overwriting first
+        let secondOpened = workspace.openFiles(at: [file2])
+        #expect(secondOpened.count == 1)
+        #expect(secondOpened[0].id != emptyEditor.id)
+        #expect(workspace.editors.count == 2)
+        #expect(openedTabIDs == [secondOpened[0].id])
+        #expect(secondOpened[0].title == "portrait")
+        #expect(secondOpened[0].document.canvasSize == CGSize(width: 80, height: 110))
+        #expect(emptyEditor.document.canvasSize == CGSize(width: 200, height: 120))
+        #expect(emptyEditor.document.layers.count == 1)
+    }
+
+    @Test("Bug 2: Cold launch opening files loads them directly without leaving an empty Untitled document")
+    func workspaceColdLaunchOpenFilesClaimsWithoutUntitled() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RecorteColdLaunchTest-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let file1 = tempDir.appendingPathComponent("first.png")
+        let file2 = tempDir.appendingPathComponent("second.png")
+        try ImageExporter.export(makeSolidImage(width: 180, height: 90, r: 90, g: 180, b: 60), to: file1, format: .png)
+        try ImageExporter.export(makeSolidImage(width: 120, height: 120, r: 180, g: 60, b: 140), to: file2, format: .png)
+
+        let workspace = Workspace()
+        #expect(!workspace.hasAttachedWindow)
+
+        let opened = workspace.openFiles(at: [file1, file2])
+        #expect(opened.count == 2)
+        #expect(workspace.editors.count == 2)
+
+        // First SwiftUI window claims the first opened file rather than creating Untitled
+        let claimedID = workspace.claimOrCreateEditorID()
+        let firstEditor = workspace.resolveEditor(id: claimedID)
+        #expect(firstEditor.title == "first")
+        #expect(firstEditor.document.canvasSize == CGSize(width: 180, height: 90))
+        #expect(workspace.editors.count == 2)
+
+        // Once the first window attaches, draining unclaimed tabs opens the second file as a tab
+        var drainedTabIDs: [UUID] = []
+        workspace.hasAttachedWindow = true
+        workspace.onRequestOpenTab = { id in
+            drainedTabIDs.append(id)
+        }
+        workspace.drainUnclaimedTabs()
+        #expect(drainedTabIDs == [opened[1].id])
+    }
+
+    @Test("Bug 1: WindowTabCoordinator configures preferred tabbing and merges new windows into the active tab group")
+    func windowTabCoordinatorMergesNewWindowsIntoTabs() {
+        let coordinator = WindowTabCoordinator()
+        let firstID = UUID()
+        let secondID = UUID()
+
+        let window1 = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        let window2 = NSWindow(
+            contentRect: NSRect(x: 40, y: 40, width: 800, height: 600),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        defer {
+            window2.orderOut(nil)
+            window1.orderOut(nil)
+        }
+
+        window1.orderBack(nil)
+        coordinator.registerAndMergeIfNeeded(window: window1, editorID: firstID, title: "First")
+        #expect(NSWindow.allowsAutomaticWindowTabbing)
+        #expect(window1.tabbingMode == .preferred)
+        #expect(window1.tabbingIdentifier == WindowTabCoordinator.tabbingIdentifier)
+        #expect(window1.title == "First")
+
+        coordinator.registerAndMergeIfNeeded(window: window2, editorID: secondID, title: "Second")
+        #expect(window2.tabbingMode == .preferred)
+        #expect(window2.tabbingIdentifier == WindowTabCoordinator.tabbingIdentifier)
+        #expect(window2.tabGroup === window1.tabGroup)
+        #expect(window1.tabbedWindows?.contains(window2) == true)
+    }
 }

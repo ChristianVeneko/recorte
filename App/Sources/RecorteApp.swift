@@ -19,13 +19,26 @@ struct RecorteApp: App {
     static let editorWindowID = "editor"
 
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    @Environment(\.openWindow) private var openWindow
 
     var body: some Scene {
-        WindowGroup(id: Self.editorWindowID) {
-            EditorWindowView()
+        let _ = configureWindowOpener()
+
+        WindowGroup(id: Self.editorWindowID, for: UUID.self) { $editorID in
+            EditorWindowView(editorID: editorID)
+        } defaultValue: {
+            Workspace.shared.claimOrCreateEditorID()
         }
+        .handlesExternalEvents(matching: [])
         .commands {
             RecorteMenuCommands()
+        }
+    }
+
+    private func configureWindowOpener() {
+        let openWindowAction = openWindow
+        Workspace.shared.onRequestOpenTab = { id in
+            openWindowAction(id: Self.editorWindowID, value: id)
         }
     }
 }
@@ -34,6 +47,29 @@ struct RecorteApp: App {
 private final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSWindow.allowsAutomaticWindowTabbing = true
+        // If cold-launched via `open -a Recorte file.png` and macOS suppressed the initial
+        // WindowGroup window because handlesExternalEvents is empty, open tabs for any
+        // unclaimed editors queued by application(_:open:).
+        DispatchQueue.main.async {
+            if Workspace.shared.hasUnclaimedEditors {
+                Workspace.shared.drainUnclaimedTabs()
+            }
+        }
+    }
+
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        let opened = Workspace.shared.openFiles(at: urls)
+        NSApp.activate()
+        if let firstID = opened.first?.id,
+           let window = WindowTabCoordinator.shared.window(for: firstID) {
+            window.makeKeyAndOrderFront(nil)
+        }
+        DispatchQueue.main.async {
+            if Workspace.shared.hasUnclaimedEditors {
+                Workspace.shared.drainUnclaimedTabs()
+            }
+        }
     }
 }
 
@@ -41,31 +77,29 @@ private struct RecorteMenuCommands: Commands {
     @FocusedValue(\.activeEditorModel) private var activeModel
     @Environment(\.openWindow) private var openWindow
 
+    private var currentModel: EditorModel? {
+        activeModel ?? Workspace.shared.activeEditor
+    }
+
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
             Button("New Tab") {
-                openWindow(id: RecorteApp.editorWindowID)
+                let editor = Workspace.shared.createEditor()
+                openWindow(id: RecorteApp.editorWindowID, value: editor.id)
             }
             .keyboardShortcut("t", modifiers: .command)
 
             Button("New Collage…") {
-                activeModel?.isPresentingCollageSheet = true
+                currentModel?.isPresentingCollageSheet = true
             }
             .keyboardShortcut("n", modifiers: [.command, .shift])
-            .disabled(activeModel == nil)
+            .disabled(currentModel == nil)
 
             Divider()
 
             Button("Open…") {
-                guard let model = activeModel else { return }
                 ExportPanelController.presentOpenPanel(allowProjects: true) { urls in
-                    for url in urls {
-                        do {
-                            try model.openFile(from: url)
-                        } catch {
-                            model.lastErrorMessage = "Could not open \(url.lastPathComponent)."
-                        }
-                    }
+                    _ = Workspace.shared.openFiles(at: urls, preferredEditor: currentModel)
                 }
             }
             .keyboardShortcut("o", modifiers: .command)
@@ -73,55 +107,55 @@ private struct RecorteMenuCommands: Commands {
             Divider()
 
             Button("Save Project") {
-                guard let model = activeModel else { return }
+                guard let model = currentModel else { return }
                 ExportPanelController.saveOrPromptProject(for: model)
             }
             .keyboardShortcut("s", modifiers: .command)
-            .disabled(!(activeModel?.hasCanvasSurface ?? false))
+            .disabled(!(currentModel?.hasCanvasSurface ?? false))
 
             Button("Save Project As…") {
-                guard let model = activeModel else { return }
+                guard let model = currentModel else { return }
                 ExportPanelController.presentSaveProjectPanel(for: model)
             }
             .keyboardShortcut("s", modifiers: [.command, .shift])
-            .disabled(!(activeModel?.hasCanvasSurface ?? false))
+            .disabled(!(currentModel?.hasCanvasSurface ?? false))
 
             Divider()
 
             Button("Save to Downloads") {
-                guard let model = activeModel else { return }
+                guard let model = currentModel else { return }
                 do {
                     try model.saveToDownloads(format: .png)
                 } catch {
                     model.lastErrorMessage = "Could not save to Downloads."
                 }
             }
-            .disabled(!(activeModel?.hasCanvasSurface ?? false))
+            .disabled(!(currentModel?.hasCanvasSurface ?? false))
 
             Button("Export PNG…") {
-                guard let model = activeModel else { return }
+                guard let model = currentModel else { return }
                 ExportPanelController.presentExportPanel(for: model, format: .png)
             }
             .keyboardShortcut("e", modifiers: .command)
-            .disabled(!(activeModel?.hasCanvasSurface ?? false))
+            .disabled(!(currentModel?.hasCanvasSurface ?? false))
 
             Button("Export JPEG…") {
-                guard let model = activeModel else { return }
+                guard let model = currentModel else { return }
                 ExportPanelController.presentExportPanel(for: model, format: .jpeg(quality: 0.9))
             }
-            .disabled(!(activeModel?.hasCanvasSurface ?? false))
+            .disabled(!(currentModel?.hasCanvasSurface ?? false))
 
             Button("Export HEIC…") {
-                guard let model = activeModel else { return }
+                guard let model = currentModel else { return }
                 ExportPanelController.presentExportPanel(for: model, format: .heic(quality: 0.9))
             }
-            .disabled(!(activeModel?.hasCanvasSurface ?? false))
+            .disabled(!(currentModel?.hasCanvasSurface ?? false))
 
             Button("Export PDF…") {
-                guard let model = activeModel else { return }
+                guard let model = currentModel else { return }
                 ExportPanelController.presentExportPDFPanel(for: model)
             }
-            .disabled(!(activeModel?.hasCanvasSurface ?? false))
+            .disabled(!(currentModel?.hasCanvasSurface ?? false))
         }
 
         CommandGroup(replacing: .pasteboard) {
@@ -134,25 +168,25 @@ private struct RecorteMenuCommands: Commands {
                 if NSApp.keyWindow?.firstResponder is NSTextView {
                     NSApp.sendAction(#selector(NSText.copy(_:)), to: nil, from: nil)
                 } else {
-                    activeModel?.copyCompositeToClipboard()
+                    currentModel?.copyCompositeToClipboard()
                 }
             }
             .keyboardShortcut("c", modifiers: .command)
 
             Button("Copy Rendered Image") {
-                activeModel?.copyCompositeToClipboard()
+                currentModel?.copyCompositeToClipboard()
             }
             .keyboardShortcut("c", modifiers: [.command, .shift])
-            .disabled(!(activeModel?.hasCanvasSurface ?? false))
+            .disabled(!(currentModel?.hasCanvasSurface ?? false))
 
             Button("Paste") {
                 if NSApp.keyWindow?.firstResponder is NSTextView {
                     NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: nil)
-                } else if let model = activeModel {
+                } else {
                     do {
-                        try model.pasteFromPasteboard()
+                        try Workspace.shared.pasteFromPasteboard(preferredEditor: currentModel)
                     } catch {
-                        model.lastErrorMessage = "No image found on the clipboard."
+                        currentModel?.lastErrorMessage = "No image found on the clipboard."
                     }
                 }
             }
@@ -166,119 +200,119 @@ private struct RecorteMenuCommands: Commands {
 
         CommandMenu("Image") {
             Button("Resize…") {
-                activeModel?.isPresentingResizeSheet = true
+                currentModel?.isPresentingResizeSheet = true
             }
-            .disabled(!(activeModel?.hasCanvasSurface ?? false))
+            .disabled(!(currentModel?.hasCanvasSurface ?? false))
 
             Divider()
 
             Button("Rotate 90° Left") {
-                guard let model = activeModel else { return }
+                guard let model = currentModel else { return }
                 do {
                     try model.rotateDocument90(direction: .left90)
                 } catch {
                     model.lastErrorMessage = "Could not rotate image."
                 }
             }
-            .disabled(!(activeModel?.hasCanvasSurface ?? false))
+            .disabled(!(currentModel?.hasCanvasSurface ?? false))
 
             Button("Rotate 90° Right") {
-                guard let model = activeModel else { return }
+                guard let model = currentModel else { return }
                 do {
                     try model.rotateDocument90(direction: .right90)
                 } catch {
                     model.lastErrorMessage = "Could not rotate image."
                 }
             }
-            .disabled(!(activeModel?.hasCanvasSurface ?? false))
+            .disabled(!(currentModel?.hasCanvasSurface ?? false))
 
             Divider()
 
             Button("Flip Horizontal") {
-                guard let model = activeModel else { return }
+                guard let model = currentModel else { return }
                 do {
                     try model.flipDocument(axis: .horizontal)
                 } catch {
                     model.lastErrorMessage = "Could not flip image."
                 }
             }
-            .disabled(!(activeModel?.hasCanvasSurface ?? false))
+            .disabled(!(currentModel?.hasCanvasSurface ?? false))
 
             Button("Flip Vertical") {
-                guard let model = activeModel else { return }
+                guard let model = currentModel else { return }
                 do {
                     try model.flipDocument(axis: .vertical)
                 } catch {
                     model.lastErrorMessage = "Could not flip image."
                 }
             }
-            .disabled(!(activeModel?.hasCanvasSurface ?? false))
+            .disabled(!(currentModel?.hasCanvasSurface ?? false))
         }
 
         CommandMenu("Layer") {
             Button("Duplicate Layer") {
-                activeModel?.duplicateSelectedLayer()
+                currentModel?.duplicateSelectedLayer()
             }
             .keyboardShortcut("d", modifiers: .command)
-            .disabled(activeModel?.selectedLayer == nil)
+            .disabled(currentModel?.selectedLayer == nil)
 
             Button("Delete Layer") {
-                activeModel?.deleteSelectedLayer()
+                currentModel?.deleteSelectedLayer()
             }
-            .disabled(activeModel?.selectedLayer == nil)
+            .disabled(currentModel?.selectedLayer == nil)
 
             Divider()
 
             Button("Remove Background") {
-                guard let model = activeModel else { return }
+                guard let model = currentModel else { return }
                 Task {
                     await model.removeBackgroundFromSelectedLayer()
                 }
             }
             .keyboardShortcut("b", modifiers: [.command, .shift])
-            .disabled(!(activeModel?.canRemoveBackground ?? false))
+            .disabled(!(currentModel?.canRemoveBackground ?? false))
         }
 
         CommandMenu("Tools") {
             Button("Move (V)") {
-                activeModel?.activeTool = .move
+                currentModel?.activeTool = .move
             }
             Button("Crop (C)") {
-                if let model = activeModel, model.hasCanvasSurface {
+                if let model = currentModel, model.hasCanvasSurface {
                     model.beginCrop()
                 }
             }
-            .disabled(!(activeModel?.hasCanvasSurface ?? false))
+            .disabled(!(currentModel?.hasCanvasSurface ?? false))
             Button("Lasso Cutout (L)") {
-                activeModel?.activeTool = .lasso
+                currentModel?.activeTool = .lasso
             }
-            .disabled(!(activeModel?.hasEditableImageLayer ?? false))
+            .disabled(!(currentModel?.hasEditableImageLayer ?? false))
             Button("Perspective (P)") {
-                activeModel?.beginPerspective()
+                currentModel?.beginPerspective()
             }
-            .disabled(!(activeModel?.hasEditableImageLayer ?? false))
+            .disabled(!(currentModel?.hasEditableImageLayer ?? false))
             Button("Clone Stamp (K)") {
-                activeModel?.activeTool = .clone
+                currentModel?.activeTool = .clone
             }
-            .disabled(!(activeModel?.hasEditableImageLayer ?? false))
+            .disabled(!(currentModel?.hasEditableImageLayer ?? false))
             Button("Deform (W)") {
-                activeModel?.activeTool = .deform
+                currentModel?.activeTool = .deform
             }
-            .disabled(!(activeModel?.hasEditableImageLayer ?? false))
+            .disabled(!(currentModel?.hasEditableImageLayer ?? false))
 
             Divider()
 
             Button("Text (T)") {
-                activeModel?.activeTool = .text
+                currentModel?.activeTool = .text
             }
             Button("Shapes (S)") {
-                activeModel?.activeTool = .shapes
+                currentModel?.activeTool = .shapes
             }
             Button("Stickers") {
-                activeModel?.activeTool = .stickers
+                currentModel?.activeTool = .stickers
             }
             Button("Draw (B)") {
-                activeModel?.activeTool = .draw
+                currentModel?.activeTool = .draw
             }
         }
 

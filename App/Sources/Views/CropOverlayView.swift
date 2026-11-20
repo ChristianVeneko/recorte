@@ -101,57 +101,47 @@ struct CropOverlayView: View {
 
     private var cropFloatingBar: some View {
         HStack(spacing: 6) {
-            // Aspect ratio chips
-            ForEach(CropAspect.allCases, id: \.self) { aspect in
-                Button {
-                    model.updateCropAspect(aspect)
-                } label: {
-                    Text(aspect.shortLabel)
-                        .font(.caption.weight(spec.aspect == aspect ? .semibold : .regular))
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 4)
+            // Compact shape picker buttons (aspect ratio & rotation live in the inspector)
+            HStack(spacing: 2) {
+                ForEach(CropShapePreset.allCases) { preset in
+                    Button {
+                        model.updateCropShape(preset.toCropShape(current: spec.shape))
+                    } label: {
+                        Image(systemName: preset.systemImage)
+                            .font(.caption)
+                            .frame(width: 24, height: 22)
+                    }
+                    .buttonStyle(.plain)
+                    .background(
+                        preset.matches(spec.shape) ? Color.accentColor : Color.clear,
+                        in: Capsule()
+                    )
+                    .foregroundStyle(preset.matches(spec.shape) ? Color.white : Color.primary)
+                    .help(preset.label)
+                    .accessibilityLabel(preset.label)
                 }
-                .buttonStyle(.plain)
-                .background(
-                    spec.aspect == aspect ? Color.accentColor : Color.clear,
-                    in: Capsule()
-                )
-                .foregroundStyle(spec.aspect == aspect ? Color.white : Color.primary)
             }
 
             Divider()
                 .frame(height: 16)
 
-            // Shape picker buttons
-            ForEach(CropShapePreset.allCases) { preset in
-                Button {
-                    model.updateCropShape(preset.toCropShape(current: spec.shape))
-                } label: {
-                    Image(systemName: preset.systemImage)
-                        .font(.caption)
-                        .frame(width: 24, height: 22)
-                }
-                .buttonStyle(.plain)
-                .background(
-                    preset.matches(spec.shape) ? Color.accentColor : Color.clear,
-                    in: Capsule()
-                )
-                .foregroundStyle(preset.matches(spec.shape) ? Color.white : Color.primary)
-                .help(preset.label)
-            }
-
-            Divider()
-                .frame(height: 16)
-
-            Button("Cancel") {
+            Button {
                 model.cancelCrop()
+            } label: {
+                Text("Cancel")
+                    .lineLimit(1)
+                    .fixedSize()
             }
             .buttonStyle(.borderless)
             .font(.caption)
             .help("Cancel Crop (Esc)")
 
-            Button("Apply") {
+            Button {
                 try? model.applyCrop()
+            } label: {
+                Text("Done")
+                    .lineLimit(1)
+                    .fixedSize()
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.small)
@@ -159,6 +149,7 @@ struct CropOverlayView: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
+        .fixedSize(horizontal: true, vertical: true)
         .background(.regularMaterial, in: Capsule())
         .shadow(color: .black.opacity(0.22), radius: 8, y: 3)
     }

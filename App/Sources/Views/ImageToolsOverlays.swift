@@ -52,13 +52,19 @@ struct LassoOverlayView: View {
                 HStack(spacing: 8) {
                     Text("Lasso Cutout")
                         .font(.caption.weight(.medium))
+                        .lineLimit(1)
+                        .fixedSize()
                     Divider().frame(height: 14)
-                    Button("Clear") {
+                    Button {
                         model.lassoPoints = []
+                    } label: {
+                        Text("Clear")
+                            .lineLimit(1)
+                            .fixedSize()
                     }
                     .buttonStyle(.borderless)
                     .font(.caption)
-                    Button("Cut Out") {
+                    Button {
                         do {
                             try model.applyLassoCutout(
                                 points: model.lassoPoints,
@@ -67,12 +73,17 @@ struct LassoOverlayView: View {
                         } catch {
                             model.lastErrorMessage = "Lasso cutout failed. Trace a region on an unlocked image layer."
                         }
+                    } label: {
+                        Text("Cut Out")
+                            .lineLimit(1)
+                            .fixedSize()
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 6)
+                .fixedSize(horizontal: true, vertical: true)
                 .background(.regularMaterial, in: Capsule())
                 .shadow(color: .black.opacity(0.22), radius: 8, y: 3)
                 .padding(.top, 14)
@@ -274,29 +285,44 @@ struct PerspectiveOverlayView: View {
             HStack(spacing: 8) {
                 Text("Perspective")
                     .font(.caption.weight(.medium))
+                    .lineLimit(1)
+                    .fixedSize()
                 Divider().frame(height: 14)
-                Button("Reset") {
+                Button {
                     model.resetPerspective()
+                } label: {
+                    Text("Reset")
+                        .lineLimit(1)
+                        .fixedSize()
                 }
                 .buttonStyle(.borderless)
                 .font(.caption)
-                Button("Cancel") {
+                Button {
                     model.cancelPerspective()
+                } label: {
+                    Text("Cancel")
+                        .lineLimit(1)
+                        .fixedSize()
                 }
                 .buttonStyle(.borderless)
                 .font(.caption)
-                Button("Apply") {
+                Button {
                     do {
                         try model.applyPerspective()
                     } catch {
                         model.lastErrorMessage = "Perspective correction failed."
                     }
+                } label: {
+                    Text("Apply")
+                        .lineLimit(1)
+                        .fixedSize()
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
+            .fixedSize(horizontal: true, vertical: true)
             .background(.regularMaterial, in: Capsule())
             .shadow(color: .black.opacity(0.22), radius: 8, y: 3)
             .padding(.top, 14)
