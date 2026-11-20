@@ -30,20 +30,37 @@ public struct RGBAColor: Sendable, Equatable, Hashable, Codable {
     public static let yellow = RGBAColor(r: 1, g: 1, b: 0, a: 1)
 }
 
+/// Decorative frame applied when rendering an image layer.
+public enum ImageFrame: Sendable, Equatable, Hashable, Codable {
+    case none
+    case border(width: Double, color: RGBAColor)
+    case roundedCorners(radius: Double)
+    case polaroid(caption: String? = nil, borderColor: RGBAColor = .white)
+    case dropShadow(
+        radius: Double = 12.0,
+        offsetX: Double = 0.0,
+        offsetY: Double = 6.0,
+        color: RGBAColor = RGBAColor(r: 0, g: 0, b: 0, a: 0.45)
+    )
+}
+
 /// A thread-safe Sendable value wrapper around `CGImage` (which is immutable).
 public struct SendableImage: @unchecked Sendable, Equatable {
     public let cgImage: CGImage
     public var filterPreset: FilterPreset
     public var adjustments: Adjustments
+    public var frame: ImageFrame
 
     public init(
         _ cgImage: CGImage,
         filterPreset: FilterPreset = .none,
-        adjustments: Adjustments = Adjustments()
+        adjustments: Adjustments = Adjustments(),
+        frame: ImageFrame = .none
     ) {
         self.cgImage = cgImage
         self.filterPreset = filterPreset
         self.adjustments = adjustments
+        self.frame = frame
     }
 
     public var width: Int { cgImage.width }
@@ -53,11 +70,12 @@ public struct SendableImage: @unchecked Sendable, Equatable {
     public static func == (lhs: SendableImage, rhs: SendableImage) -> Bool {
         lhs.cgImage === rhs.cgImage &&
         lhs.filterPreset == rhs.filterPreset &&
-        lhs.adjustments == rhs.adjustments
+        lhs.adjustments == rhs.adjustments &&
+        lhs.frame == rhs.frame
     }
 }
 
-// MARK: - Specs for Text, Shape, Sticker
+// MARK: - Specs for Text, Shape, Sticker, Drawing
 
 public enum TextAlignmentSpec: String, Sendable, Equatable, Hashable, Codable, CaseIterable {
     case left
@@ -75,6 +93,25 @@ public struct TextStrokeSpec: Sendable, Equatable, Hashable, Codable {
     }
 }
 
+public struct TextGradientSpec: Sendable, Equatable, Hashable, Codable {
+    public var colors: [RGBAColor]
+    /// Gradient angle in degrees in top-left canvas coordinates (0 = left-to-right, 90 = top-to-bottom).
+    public var angleDegrees: Double
+
+    public init(colors: [RGBAColor], angleDegrees: Double = 0.0) {
+        self.colors = colors
+        self.angleDegrees = angleDegrees
+    }
+}
+
+public enum TextBubbleStyle: String, Sendable, Equatable, Hashable, Codable, CaseIterable {
+    case none
+    case rounded
+    case speech
+    case thought
+    case shout
+}
+
 public struct TextSpec: Sendable, Equatable, Hashable, Codable {
     public var string: String
     public var fontName: String
@@ -83,6 +120,11 @@ public struct TextSpec: Sendable, Equatable, Hashable, Codable {
     public var alignment: TextAlignmentSpec
     public var stroke: TextStrokeSpec?
     public var background: RGBAColor?
+    public var gradient: TextGradientSpec?
+    public var bubble: TextBubbleStyle
+    public var bubbleColor: RGBAColor?
+    public var bubbleStrokeColor: RGBAColor?
+    public var bubbleStrokeWidth: Double
 
     public init(
         string: String,
@@ -91,7 +133,12 @@ public struct TextSpec: Sendable, Equatable, Hashable, Codable {
         color: RGBAColor = .white,
         alignment: TextAlignmentSpec = .center,
         stroke: TextStrokeSpec? = nil,
-        background: RGBAColor? = nil
+        background: RGBAColor? = nil,
+        gradient: TextGradientSpec? = nil,
+        bubble: TextBubbleStyle = .none,
+        bubbleColor: RGBAColor? = nil,
+        bubbleStrokeColor: RGBAColor? = nil,
+        bubbleStrokeWidth: Double = 2.0
     ) {
         self.string = string
         self.fontName = fontName
@@ -100,6 +147,32 @@ public struct TextSpec: Sendable, Equatable, Hashable, Codable {
         self.alignment = alignment
         self.stroke = stroke
         self.background = background
+        self.gradient = gradient
+        self.bubble = bubble
+        self.bubbleColor = bubbleColor
+        self.bubbleStrokeColor = bubbleStrokeColor
+        self.bubbleStrokeWidth = bubbleStrokeWidth
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case string, fontName, size, color, alignment, stroke, background
+        case gradient, bubble, bubbleColor, bubbleStrokeColor, bubbleStrokeWidth
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.string = try c.decode(String.self, forKey: .string)
+        self.fontName = try c.decodeIfPresent(String.self, forKey: .fontName) ?? "HelveticaNeue-Bold"
+        self.size = try c.decodeIfPresent(Double.self, forKey: .size) ?? 32.0
+        self.color = try c.decodeIfPresent(RGBAColor.self, forKey: .color) ?? .white
+        self.alignment = try c.decodeIfPresent(TextAlignmentSpec.self, forKey: .alignment) ?? .center
+        self.stroke = try c.decodeIfPresent(TextStrokeSpec.self, forKey: .stroke)
+        self.background = try c.decodeIfPresent(RGBAColor.self, forKey: .background)
+        self.gradient = try c.decodeIfPresent(TextGradientSpec.self, forKey: .gradient)
+        self.bubble = try c.decodeIfPresent(TextBubbleStyle.self, forKey: .bubble) ?? .none
+        self.bubbleColor = try c.decodeIfPresent(RGBAColor.self, forKey: .bubbleColor)
+        self.bubbleStrokeColor = try c.decodeIfPresent(RGBAColor.self, forKey: .bubbleStrokeColor)
+        self.bubbleStrokeWidth = try c.decodeIfPresent(Double.self, forKey: .bubbleStrokeWidth) ?? 2.0
     }
 }
 
@@ -109,6 +182,8 @@ public enum ShapeKind: Sendable, Equatable, Hashable, Codable {
     case ellipse
     case line
     case arrow
+    case triangle
+    case star
 }
 
 public struct ShapeSpec: Sendable, Equatable, Hashable, Codable {
@@ -162,6 +237,40 @@ public struct StickerSpec: Sendable, Equatable, Hashable, Codable {
     }
 }
 
+public enum DrawingToolKind: String, Sendable, Equatable, Hashable, Codable, CaseIterable {
+    case brush
+    case marker
+    case highlighter
+}
+
+public struct DrawingStroke: Sendable, Equatable, Hashable, Codable {
+    /// Points in layer-local top-left coordinates (equivalent to canvas coordinates when transform is identity).
+    public var points: [CGPoint]
+    public var color: RGBAColor
+    public var width: Double
+    public var tool: DrawingToolKind
+
+    public init(
+        points: [CGPoint],
+        color: RGBAColor = .red,
+        width: Double = 6.0,
+        tool: DrawingToolKind = .brush
+    ) {
+        self.points = points
+        self.color = color
+        self.width = width
+        self.tool = tool
+    }
+}
+
+public struct DrawingSpec: Sendable, Equatable, Hashable, Codable {
+    public var strokes: [DrawingStroke]
+
+    public init(strokes: [DrawingStroke] = []) {
+        self.strokes = strokes
+    }
+}
+
 // MARK: - Layer & Document Model
 
 public enum LayerKind: Sendable, Equatable {
@@ -169,6 +278,7 @@ public enum LayerKind: Sendable, Equatable {
     case text(TextSpec)
     case shape(ShapeSpec)
     case sticker(StickerSpec)
+    case drawing(DrawingSpec)
 }
 
 public struct LayerTransform: Sendable, Equatable, Hashable, Codable {
