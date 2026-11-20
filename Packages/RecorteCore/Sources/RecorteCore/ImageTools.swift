@@ -343,6 +343,11 @@ public enum ImageTools {
         return cgOut
     }
 
+    /// Applies a liquify-style deform brush stroke (`DeformStroke`) in top-left image coordinates.
+    public static func deformBrush(_ image: CGImage, stroke: DeformStroke) throws -> CGImage {
+        try DeformBrush.applyStroke(image, stroke: stroke)
+    }
+
     // MARK: - 5. Curves (CIToneCurve)
 
     /// Applies a 5-point tone curve via `CIToneCurve`.
