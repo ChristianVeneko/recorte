@@ -8,6 +8,22 @@ struct DrawingOverlayView: View {
 
     @State private var currentCanvasPoints: [CGPoint] = []
 
+    private var strokeOpacity: Double {
+        switch model.drawingToolKind {
+        case .brush: 1.0
+        case .marker: 0.85
+        case .highlighter: 0.38
+        }
+    }
+
+    private var strokeCap: CGLineCap {
+        switch model.drawingToolKind {
+        case .brush: .round
+        case .marker: .round
+        case .highlighter: .square
+        }
+    }
+
     var body: some View {
         Canvas { context, _ in
             guard !currentCanvasPoints.isEmpty else { return }
@@ -17,11 +33,14 @@ struct DrawingOverlayView: View {
                     y: canvasFrame.minY + pt.y * displayScale
                 )
             }
+            let effectiveWidth = max(1, CGFloat(model.brushLineWidth) * displayScale)
+            let previewColor = model.brushColor.swiftUIColor.opacity(strokeOpacity)
+
             var path = Path()
             if viewPoints.count == 1, let first = viewPoints.first {
-                let r = max(1, CGFloat(model.brushLineWidth) * displayScale / 2.0)
+                let r = effectiveWidth / 2.0
                 path.addEllipse(in: CGRect(x: first.x - r, y: first.y - r, width: r * 2, height: r * 2))
-                context.fill(path, with: .color(model.brushColor.swiftUIColor))
+                context.fill(path, with: .color(previewColor))
             } else {
                 path.move(to: viewPoints[0])
                 for pt in viewPoints.dropFirst() {
@@ -29,10 +48,10 @@ struct DrawingOverlayView: View {
                 }
                 context.stroke(
                     path,
-                    with: .color(model.brushColor.swiftUIColor),
+                    with: .color(previewColor),
                     style: StrokeStyle(
-                        lineWidth: max(1, CGFloat(model.brushLineWidth) * displayScale),
-                        lineCap: .round,
+                        lineWidth: effectiveWidth,
+                        lineCap: strokeCap,
                         lineJoin: .round
                     )
                 )
@@ -55,7 +74,8 @@ struct DrawingOverlayView: View {
                         model.commitBrushStroke(
                             points: stroke,
                             color: model.brushColor,
-                            lineWidth: model.brushLineWidth
+                            lineWidth: model.brushLineWidth,
+                            tool: model.drawingToolKind
                         )
                     }
                 }

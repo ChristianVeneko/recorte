@@ -26,7 +26,7 @@ struct EditorWindowView: View {
                 workspace: workspace,
                 zoomFactor: $zoomFactor,
                 showTray: $showTray,
-                onOpenFile: openImageFile,
+                onOpenFile: openImageOrProjectFile,
                 onPaste: pasteFromClipboard
             )
         }
@@ -88,9 +88,9 @@ struct EditorWindowView: View {
                 Button {
                     model.shareViaAirDrop()
                 } label: {
-                    Label("AirDrop", systemImage: "airdrop")
+                    Label("AirDrop", systemImage: "dot.radiowaves.left.and.right")
                 }
-                .disabled(model.isEmpty)
+                .disabled(!model.hasCanvasSurface)
                 .help("Share via AirDrop")
 
                 Button {
@@ -98,10 +98,18 @@ struct EditorWindowView: View {
                 } label: {
                     Label("Copy", systemImage: "doc.on.doc")
                 }
-                .disabled(model.isEmpty)
+                .disabled(!model.hasCanvasSurface)
                 .help("Copy Rendered Image (⇧⌘C)")
 
                 Menu {
+                    Button("Save to Downloads") {
+                        do {
+                            try model.saveToDownloads(format: .png)
+                        } catch {
+                            model.lastErrorMessage = "Could not save to Downloads."
+                        }
+                    }
+                    Divider()
                     Button("Export PNG…") {
                         ExportPanelController.presentExportPanel(for: model, format: .png)
                     }
@@ -111,10 +119,13 @@ struct EditorWindowView: View {
                     Button("Export HEIC…") {
                         ExportPanelController.presentExportPanel(for: model, format: .heic(quality: 0.9))
                     }
+                    Button("Export PDF…") {
+                        ExportPanelController.presentExportPDFPanel(for: model)
+                    }
                 } label: {
                     Label("Export", systemImage: "square.and.arrow.down")
                 }
-                .disabled(model.isEmpty)
+                .disabled(!model.hasCanvasSurface)
                 .help("Export Image (⌘E)")
 
                 Button {
@@ -134,8 +145,14 @@ struct EditorWindowView: View {
                 .help("Toggle Inspector")
             }
         }
+        .sheet(isPresented: $model.isPresentingResizeSheet) {
+            ResizeSheetView(model: model)
+        }
+        .sheet(isPresented: $model.isPresentingCollageSheet) {
+            CollageSheetView(model: model, workspace: workspace)
+        }
         .navigationTitle(model.title)
-        .frame(minWidth: 960, minHeight: 620)
+        .frame(minWidth: 960, minHeight: 640)
         .background(
             WindowTabbingBridge(title: model.title) { window in
                 hostWindow = window
@@ -169,11 +186,11 @@ struct EditorWindowView: View {
         }
     }
 
-    private func openImageFile() {
-        ExportPanelController.presentOpenPanel { urls in
+    private func openImageOrProjectFile() {
+        ExportPanelController.presentOpenPanel(allowProjects: true) { urls in
             for url in urls {
                 do {
-                    try model.openImage(from: url)
+                    try model.openFile(from: url)
                 } catch {
                     model.lastErrorMessage = "Could not open \(url.lastPathComponent)."
                 }
@@ -216,7 +233,7 @@ private struct WindowTabbingBridge: NSViewRepresentable {
     }
 }
 
-// MARK: - Single-Key Shortcuts Bridge (S9)
+// MARK: - Single-Key Shortcuts Bridge (S9 & S15)
 
 private struct SingleKeyShortcutBridge: NSViewRepresentable {
     let model: EditorModel
@@ -270,7 +287,6 @@ private struct SingleKeyShortcutBridge: NSViewRepresentable {
 
         private func handleKeyEvent(_ event: NSEvent) -> NSEvent? {
             guard let hostWindow, event.window === hostWindow else { return event }
-            // Do not intercept while typing inside any text field or text view
             if hostWindow.firstResponder is NSTextView {
                 return event
             }
@@ -278,11 +294,18 @@ private struct SingleKeyShortcutBridge: NSViewRepresentable {
             let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
             guard modifiers.isEmpty else { return event }
 
-            // Special keys: Return (36 / 76), Escape (53), Delete / Forward Delete (51 / 117)
             switch event.keyCode {
             case 36, 76: // Return / Enter
                 if model.activeTool == .crop && model.cropSpec != nil {
                     try? model.applyCrop()
+                    return nil
+                }
+                if model.activeTool == .perspective && model.perspectiveQuad != nil {
+                    try? model.applyPerspective()
+                    return nil
+                }
+                if model.activeTool == .lasso && model.lassoPoints.count >= 3 {
+                    try? model.applyLassoCutout(points: model.lassoPoints, cropToBounds: model.lassoCropToBounds)
                     return nil
                 }
             case 53: // Escape
@@ -290,8 +313,17 @@ private struct SingleKeyShortcutBridge: NSViewRepresentable {
                     model.cancelCrop()
                     return nil
                 }
+                if model.activeTool == .perspective {
+                    model.cancelPerspective()
+                    return nil
+                }
+                if model.activeTool == .lasso && !model.lassoPoints.isEmpty {
+                    model.lassoPoints = []
+                    return nil
+                }
             case 51, 117: // Backspace / Forward Delete
-                if model.activeTool != .crop, model.selectedLayer != nil {
+                if model.activeTool != .crop && model.activeTool != .perspective,
+                   model.selectedLayer != nil {
                     model.deleteSelectedLayer()
                     return nil
                 }
@@ -305,8 +337,28 @@ private struct SingleKeyShortcutBridge: NSViewRepresentable {
                 model.activeTool = .move
                 return nil
             case "c":
-                if !model.isEmpty {
+                if model.hasCanvasSurface {
                     model.beginCrop()
+                }
+                return nil
+            case "l":
+                if model.hasEditableImageLayer {
+                    model.activeTool = .lasso
+                }
+                return nil
+            case "p":
+                if model.hasEditableImageLayer {
+                    model.beginPerspective()
+                }
+                return nil
+            case "k":
+                if model.hasEditableImageLayer {
+                    model.activeTool = .clone
+                }
+                return nil
+            case "w":
+                if model.hasEditableImageLayer {
+                    model.activeTool = .deform
                 }
                 return nil
             case "t":

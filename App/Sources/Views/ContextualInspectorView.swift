@@ -22,7 +22,8 @@ struct ContextualInspectorView: View {
             VStack(alignment: .leading, spacing: 16) {
                 contextualPrimarySection
 
-                if let layer = model.selectedLayer, model.activeTool != .crop {
+                if let layer = model.selectedLayer,
+                   model.activeTool != .crop && model.activeTool != .perspective {
                     Divider()
                     transformSection(for: layer)
                 }
@@ -32,7 +33,7 @@ struct ContextualInspectorView: View {
             }
             .padding(14)
         }
-        .frame(minWidth: 250, idealWidth: 276)
+        .frame(minWidth: 250, idealWidth: 280)
         .onChange(of: selectedImageIdentifier) { _, _ in
             regenerateFilterThumbnails()
         }
@@ -46,7 +47,7 @@ struct ContextualInspectorView: View {
         switch layer.kind {
         case .image(let img):
             return ObjectIdentifier(img.cgImage)
-        case .text, .shape, .sticker:
+        case .text, .shape, .sticker, .drawing:
             return nil
         default:
             return nil
@@ -58,6 +59,14 @@ struct ContextualInspectorView: View {
         switch model.activeTool {
         case .crop:
             cropInspectorSection
+        case .lasso:
+            lassoInspectorSection
+        case .perspective:
+            perspectiveInspectorSection
+        case .clone:
+            cloneInspectorSection
+        case .deform:
+            deformInspectorSection
         case .draw:
             drawInspectorSection
         case .text:
@@ -83,6 +92,8 @@ struct ContextualInspectorView: View {
                 shapesInspectorSection
             case .sticker:
                 stickersInspectorSection
+            case .drawing:
+                drawInspectorSection
             default:
                 inspectorHeader("Layer", systemImage: "square.stack.3d.up")
                 Text("Select a tool or adjust transform properties below.")
@@ -92,6 +103,162 @@ struct ContextualInspectorView: View {
         } else {
             inspectorHeader("Inspector", systemImage: "slider.horizontal.3")
             Text("Paste an image (⌘V) or select a layer to inspect its properties.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: - S15: Lasso, Perspective, Clone Stamp, Deform Inspectors
+
+    @ViewBuilder
+    private var lassoInspectorSection: some View {
+        inspectorHeader("Lasso Cutout", systemImage: "lasso")
+
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Drag freehand on the canvas to trace a cutout region, then click Cut Out (or press Return).")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Toggle("Crop to Cutout Bounds", isOn: $model.lassoCropToBounds)
+
+            HStack(spacing: 8) {
+                Button("Clear") {
+                    model.lassoPoints = []
+                }
+                .disabled(model.lassoPoints.isEmpty)
+                .frame(maxWidth: .infinity)
+
+                Button("Cut Out") {
+                    do {
+                        try model.applyLassoCutout(
+                            points: model.lassoPoints,
+                            cropToBounds: model.lassoCropToBounds
+                        )
+                    } catch {
+                        model.lastErrorMessage = "Trace a closed path on an unlocked image layer first."
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(model.lassoPoints.count < 3)
+                .frame(maxWidth: .infinity)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var perspectiveInspectorSection: some View {
+        inspectorHeader("Perspective", systemImage: "perspective")
+
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Drag the 4 corner handles over the region to rectify, then click Apply (or press Return).")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Button("Reset Corners") {
+                model.resetPerspective()
+            }
+            .frame(maxWidth: .infinity)
+
+            HStack(spacing: 8) {
+                Button("Cancel") {
+                    model.cancelPerspective()
+                }
+                .frame(maxWidth: .infinity)
+
+                Button("Apply") {
+                    do {
+                        try model.applyPerspective()
+                    } catch {
+                        model.lastErrorMessage = "Perspective correction failed."
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(model.perspectiveQuad == nil)
+                .frame(maxWidth: .infinity)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var cloneInspectorSection: some View {
+        inspectorHeader("Clone Stamp", systemImage: "seal")
+
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Option-click (⌥-Click) on the image to set the source point, then click or drag to paint cloned pixels.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            if let src = model.cloneSourcePoint {
+                HStack {
+                    Text("Source: \(Int(src.x.rounded())), \(Int(src.y.rounded()))")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Clear") {
+                        model.cloneSourcePoint = nil
+                    }
+                    .buttonStyle(.link)
+                    .font(.caption)
+                }
+            } else {
+                Label("No source set (⌥-Click image)", systemImage: "scope")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+
+            sliderRow(
+                title: "Radius",
+                value: $model.cloneRadius,
+                range: 4...120,
+                format: "%.0f px"
+            )
+
+            sliderRow(
+                title: "Softness",
+                value: $model.cloneSoftness,
+                range: 0...1,
+                format: "%.0f%%",
+                displayMultiplier: 100
+            )
+
+            sliderRow(
+                title: "Opacity",
+                value: $model.cloneOpacity,
+                range: 0.05...1,
+                format: "%.0f%%",
+                displayMultiplier: 100
+            )
+        }
+    }
+
+    @ViewBuilder
+    private var deformInspectorSection: some View {
+        inspectorHeader("Deform", systemImage: "hurricane")
+
+        VStack(alignment: .leading, spacing: 10) {
+            Picker("Preset", selection: $model.deformPreset) {
+                ForEach(DeformPreset.allCases, id: \.self) { preset in
+                    Text(preset.rawValue.capitalized).tag(preset)
+                }
+            }
+            .pickerStyle(.segmented)
+            .controlSize(.small)
+
+            sliderRow(
+                title: "Radius",
+                value: $model.deformRadius,
+                range: 10...300,
+                format: "%.0f px"
+            )
+
+            sliderRow(
+                title: "Strength",
+                value: $model.deformStrength,
+                range: 0.1...1.0,
+                format: "%.2f"
+            )
+
+            Text("Click on the image to apply the selected distortion at that point.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -225,11 +392,11 @@ struct ContextualInspectorView: View {
         }
     }
 
-    // MARK: - Filters & Adjustments Inspector
+    // MARK: - Filters, Adjustments, Frame (S17) & Tone Curve (S15) Inspector
 
     @ViewBuilder
     private func filtersAndAdjustmentsSection(layer: Layer, image: SendableImage) -> some View {
-        inspectorHeader("Filters & Adjustments", systemImage: "camera.filters")
+        inspectorHeader("Image", systemImage: "camera.filters")
 
         // Remove Background action
         Button {
@@ -251,7 +418,13 @@ struct ContextualInspectorView: View {
         .buttonStyle(.bordered)
         .disabled(!model.canRemoveBackground)
 
-        Text("Presets")
+        // S17: Image Frame Picker
+        Divider()
+        imageFrameSection(layer: layer, frame: image.frame)
+
+        Divider()
+
+        Text("Filters")
             .font(.caption.weight(.semibold))
             .foregroundStyle(.secondary)
 
@@ -334,6 +507,122 @@ struct ContextualInspectorView: View {
         adjustmentSlider("Vignette", value: adj.vignette, range: 0.0...2.0, format: "%.2f") { v in
             var next = adj; next.vignette = v; return next
         } layerID: { layer.id }
+
+        // S15: 5-point Tone Curve Editor
+        Divider()
+        ToneCurveEditorView(curve: $model.toneCurve) {
+            do {
+                try model.applyToneCurve(model.toneCurve, to: layer.id)
+            } catch {
+                model.lastErrorMessage = "Could not apply tone curve."
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func imageFrameSection(layer: Layer, frame: ImageFrame) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Frame")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+
+            Picker(
+                "Frame Style",
+                selection: Binding(
+                    get: { ImageFramePreset.from(frame) },
+                    set: { preset in
+                        model.setImageFrame(preset.defaultFrame(current: frame), for: layer.id)
+                    }
+                )
+            ) {
+                ForEach(ImageFramePreset.allCases) { preset in
+                    Text(preset.label).tag(preset)
+                }
+            }
+            .controlSize(.small)
+
+            switch frame {
+            case .none:
+                EmptyView()
+            case .border(let width, let color):
+                sliderRow(
+                    title: "Border Width",
+                    value: Binding(
+                        get: { width },
+                        set: { model.setImageFrame(.border(width: $0, color: color), for: layer.id, continuous: true) }
+                    ),
+                    range: 1...48,
+                    format: "%.0f px",
+                    onEnd: { model.endContinuousEdit(actionName: "Edit Frame Border") }
+                )
+                ColorPicker(
+                    "Border Color",
+                    selection: Binding(
+                        get: { color.swiftUIColor },
+                        set: { model.setImageFrame(.border(width: width, color: RGBAColor(swiftUIColor: $0)), for: layer.id) }
+                    )
+                )
+            case .roundedCorners(let radius):
+                sliderRow(
+                    title: "Corner Radius",
+                    value: Binding(
+                        get: { radius },
+                        set: { model.setImageFrame(.roundedCorners(radius: $0), for: layer.id, continuous: true) }
+                    ),
+                    range: 0...120,
+                    format: "%.0f px",
+                    onEnd: { model.endContinuousEdit(actionName: "Edit Corner Radius") }
+                )
+            case .polaroid(let caption, let borderColor):
+                TextField(
+                    "Polaroid Caption",
+                    text: Binding(
+                        get: { caption ?? "" },
+                        set: {
+                            let val = $0.isEmpty ? nil : $0
+                            model.setImageFrame(.polaroid(caption: val, borderColor: borderColor), for: layer.id)
+                        }
+                    )
+                )
+                .textFieldStyle(.roundedBorder)
+                ColorPicker(
+                    "Frame Color",
+                    selection: Binding(
+                        get: { borderColor.swiftUIColor },
+                        set: { model.setImageFrame(.polaroid(caption: caption, borderColor: RGBAColor(swiftUIColor: $0)), for: layer.id) }
+                    )
+                )
+            case .dropShadow(let radius, let offsetX, let offsetY, let color):
+                sliderRow(
+                    title: "Shadow Radius",
+                    value: Binding(
+                        get: { radius },
+                        set: {
+                            model.setImageFrame(
+                                .dropShadow(radius: $0, offsetX: offsetX, offsetY: offsetY, color: color),
+                                for: layer.id,
+                                continuous: true
+                            )
+                        }
+                    ),
+                    range: 0...48,
+                    format: "%.0f px",
+                    onEnd: { model.endContinuousEdit(actionName: "Edit Drop Shadow") }
+                )
+                ColorPicker(
+                    "Shadow Color",
+                    selection: Binding(
+                        get: { color.swiftUIColor },
+                        set: {
+                            model.setImageFrame(
+                                .dropShadow(radius: radius, offsetX: offsetX, offsetY: offsetY, color: RGBAColor(swiftUIColor: $0)),
+                                for: layer.id
+                            )
+                        }
+                    )
+                )
+            }
+        }
     }
 
     private func adjustmentSlider(
@@ -379,7 +668,7 @@ struct ContextualInspectorView: View {
         switch layer.kind {
         case .image(let sendableImg):
             sourceCG = sendableImg.cgImage
-        case .text, .shape, .sticker:
+        case .text, .shape, .sticker, .drawing:
             filterThumbnails = [:]
             filterThumbnailSourceID = nil
             return
@@ -425,7 +714,7 @@ struct ContextualInspectorView: View {
         return ctx.makeImage()
     }
 
-    // MARK: - Text Inspector
+    // MARK: - Text Inspector (S16: Gradient Fill + Speech Bubbles)
 
     @ViewBuilder
     private var textInspectorSection: some View {
@@ -435,7 +724,7 @@ struct ContextualInspectorView: View {
             guard let layer = model.selectedLayer else { return nil }
             switch layer.kind {
             case .text(let spec): return (layer.id, spec)
-            case .image, .shape, .sticker: return nil
+            case .image, .shape, .sticker, .drawing: return nil
             default: return nil
             }
         }()
@@ -509,17 +798,82 @@ struct ContextualInspectorView: View {
                 onEnd: { model.endContinuousEdit(actionName: "Resize Text") }
             )
 
-            ColorPicker(
-                "Color",
-                selection: Binding(
-                    get: { activeSpec.color.swiftUIColor },
-                    set: {
+            // S16: Solid Color or Gradient Fill
+            Toggle(
+                "Gradient Fill",
+                isOn: Binding(
+                    get: { activeSpec.gradient != nil },
+                    set: { enabled in
                         var next = activeSpec
-                        next.color = RGBAColor(swiftUIColor: $0)
+                        next.gradient = enabled
+                            ? TextGradientSpec(colors: [activeSpec.color, .yellow], angleDegrees: 0)
+                            : nil
                         updateSpec(next, false)
                     }
                 )
             )
+
+            if let gradient = activeSpec.gradient {
+                let startColor = gradient.colors.first ?? .red
+                let endColor = gradient.colors.dropFirst().first ?? .yellow
+
+                ColorPicker(
+                    "Start Color",
+                    selection: Binding(
+                        get: { startColor.swiftUIColor },
+                        set: {
+                            var next = activeSpec
+                            next.gradient = TextGradientSpec(
+                                colors: [RGBAColor(swiftUIColor: $0), endColor],
+                                angleDegrees: gradient.angleDegrees
+                            )
+                            updateSpec(next, false)
+                        }
+                    )
+                )
+
+                ColorPicker(
+                    "End Color",
+                    selection: Binding(
+                        get: { endColor.swiftUIColor },
+                        set: {
+                            var next = activeSpec
+                            next.gradient = TextGradientSpec(
+                                colors: [startColor, RGBAColor(swiftUIColor: $0)],
+                                angleDegrees: gradient.angleDegrees
+                            )
+                            updateSpec(next, false)
+                        }
+                    )
+                )
+
+                sliderRow(
+                    title: "Gradient Angle",
+                    value: Binding(
+                        get: { gradient.angleDegrees },
+                        set: {
+                            var next = activeSpec
+                            next.gradient = TextGradientSpec(colors: [startColor, endColor], angleDegrees: $0)
+                            updateSpec(next, true)
+                        }
+                    ),
+                    range: 0...360,
+                    format: "%.0f°",
+                    onEnd: { model.endContinuousEdit(actionName: "Edit Text Gradient") }
+                )
+            } else {
+                ColorPicker(
+                    "Color",
+                    selection: Binding(
+                        get: { activeSpec.color.swiftUIColor },
+                        set: {
+                            var next = activeSpec
+                            next.color = RGBAColor(swiftUIColor: $0)
+                            updateSpec(next, false)
+                        }
+                    )
+                )
+            }
 
             Picker(
                 "Alignment",
@@ -538,6 +892,75 @@ struct ContextualInspectorView: View {
             }
             .pickerStyle(.segmented)
             .controlSize(.small)
+
+            // S16: Speech Bubble Style Picker
+            Divider()
+            Picker(
+                "Bubble Style",
+                selection: Binding(
+                    get: { activeSpec.bubble },
+                    set: { style in
+                        var next = activeSpec
+                        next.bubble = style
+                        if style != .none && next.bubbleColor == nil {
+                            next.bubbleColor = .white
+                            next.bubbleStrokeColor = .black
+                            if next.color == .white && next.gradient == nil {
+                                next.color = .black
+                            }
+                        }
+                        updateSpec(next, false)
+                    }
+                )
+            ) {
+                ForEach(TextBubbleStyle.allCases, id: \.self) { style in
+                    Text(style.rawValue.capitalized).tag(style)
+                }
+            }
+            .controlSize(.small)
+
+            if activeSpec.bubble != .none {
+                ColorPicker(
+                    "Bubble Fill",
+                    selection: Binding(
+                        get: { (activeSpec.bubbleColor ?? .white).swiftUIColor },
+                        set: {
+                            var next = activeSpec
+                            next.bubbleColor = RGBAColor(swiftUIColor: $0)
+                            updateSpec(next, false)
+                        }
+                    )
+                )
+
+                ColorPicker(
+                    "Bubble Stroke",
+                    selection: Binding(
+                        get: { (activeSpec.bubbleStrokeColor ?? .black).swiftUIColor },
+                        set: {
+                            var next = activeSpec
+                            next.bubbleStrokeColor = RGBAColor(swiftUIColor: $0)
+                            updateSpec(next, false)
+                        }
+                    )
+                )
+
+                sliderRow(
+                    title: "Bubble Border",
+                    value: Binding(
+                        get: { activeSpec.bubbleStrokeWidth },
+                        set: {
+                            var next = activeSpec
+                            next.bubbleStrokeWidth = $0
+                            updateSpec(next, true)
+                        }
+                    ),
+                    range: 0...10,
+                    format: "%.1f pt",
+                    onEnd: { model.endContinuousEdit(actionName: "Edit Bubble Border") }
+                )
+            }
+
+            Divider()
 
             Toggle(
                 "Outline",
@@ -607,7 +1030,7 @@ struct ContextualInspectorView: View {
         }
     }
 
-    // MARK: - Shapes Inspector
+    // MARK: - Shapes Inspector (S17: Basic Paint Shapes incl. Triangle & Star)
 
     @ViewBuilder
     private var shapesInspectorSection: some View {
@@ -617,7 +1040,7 @@ struct ContextualInspectorView: View {
             guard let layer = model.selectedLayer else { return nil }
             switch layer.kind {
             case .shape(let spec): return (layer.id, spec)
-            case .image, .text, .sticker: return nil
+            case .image, .text, .sticker, .drawing: return nil
             default: return nil
             }
         }()
@@ -632,7 +1055,7 @@ struct ContextualInspectorView: View {
         }
 
         VStack(alignment: .leading, spacing: 10) {
-            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 5), spacing: 6) {
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 4), spacing: 6) {
                 ForEach(ShapeKindPreset.allCases) { preset in
                     Button {
                         var next = activeSpec
@@ -786,7 +1209,7 @@ struct ContextualInspectorView: View {
             guard let layer = model.selectedLayer else { return nil }
             switch layer.kind {
             case .sticker(let spec): return (layer.id, spec)
-            case .image, .text, .shape: return nil
+            case .image, .text, .shape, .drawing: return nil
             default: return nil
             }
         }()
@@ -875,13 +1298,21 @@ struct ContextualInspectorView: View {
         }
     }
 
-    // MARK: - Draw Inspector
+    // MARK: - Draw Inspector (S17: Brush / Marker / Highlighter)
 
     @ViewBuilder
     private var drawInspectorSection: some View {
-        inspectorHeader("Brush", systemImage: "paintbrush.pointed")
+        inspectorHeader("Draw", systemImage: "paintbrush.pointed")
 
         VStack(alignment: .leading, spacing: 10) {
+            Picker("Tool", selection: $model.drawingToolKind) {
+                Text("Brush").tag(DrawingToolKind.brush)
+                Text("Marker").tag(DrawingToolKind.marker)
+                Text("Highlighter").tag(DrawingToolKind.highlighter)
+            }
+            .pickerStyle(.segmented)
+            .controlSize(.small)
+
             ColorPicker(
                 "Color",
                 selection: Binding(
@@ -893,7 +1324,7 @@ struct ContextualInspectorView: View {
             sliderRow(
                 title: "Line Width",
                 value: $model.brushLineWidth,
-                range: 1...48,
+                range: 1...64,
                 format: "%.0f px"
             )
 
@@ -920,7 +1351,7 @@ struct ContextualInspectorView: View {
                 }
             }
 
-            Text("Drag on the canvas to draw freehand strokes as new layers.")
+            Text("Drag on the canvas to paint strokes with \(model.drawingToolKind.rawValue).")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -1035,6 +1466,7 @@ struct ContextualInspectorView: View {
         value: Binding<Double>,
         range: ClosedRange<Double>,
         format: String,
+        displayMultiplier: Double = 1.0,
         disabled: Bool = false,
         onEnd: (() -> Void)? = nil
     ) -> some View {
@@ -1043,7 +1475,7 @@ struct ContextualInspectorView: View {
                 Text(title)
                     .font(.caption)
                 Spacer()
-                Text(String(format: format, value.wrappedValue))
+                Text(String(format: format, value.wrappedValue * displayMultiplier))
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
@@ -1067,10 +1499,61 @@ private enum StickerPickerTab {
     case sfSymbols
 }
 
+private enum ImageFramePreset: String, CaseIterable, Identifiable {
+    case none
+    case border
+    case roundedCorners
+    case polaroid
+    case dropShadow
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .none: "None"
+        case .border: "Border"
+        case .roundedCorners: "Rounded Corners"
+        case .polaroid: "Polaroid"
+        case .dropShadow: "Drop Shadow"
+        }
+    }
+
+    static func from(_ frame: ImageFrame) -> ImageFramePreset {
+        switch frame {
+        case .none: .none
+        case .border: .border
+        case .roundedCorners: .roundedCorners
+        case .polaroid: .polaroid
+        case .dropShadow: .dropShadow
+        }
+    }
+
+    func defaultFrame(current: ImageFrame) -> ImageFrame {
+        switch self {
+        case .none:
+            return .none
+        case .border:
+            if case .border = current { return current }
+            return .border(width: 8, color: .white)
+        case .roundedCorners:
+            if case .roundedCorners = current { return current }
+            return .roundedCorners(radius: 20)
+        case .polaroid:
+            if case .polaroid = current { return current }
+            return .polaroid(caption: nil, borderColor: .white)
+        case .dropShadow:
+            if case .dropShadow = current { return current }
+            return .dropShadow(radius: 14, offsetX: 0, offsetY: 6, color: RGBAColor(r: 0, g: 0, b: 0, a: 0.45))
+        }
+    }
+}
+
 private enum ShapeKindPreset: String, CaseIterable, Identifiable {
     case rect
     case roundedRect
     case ellipse
+    case triangle
+    case star
     case line
     case arrow
 
@@ -1081,6 +1564,8 @@ private enum ShapeKindPreset: String, CaseIterable, Identifiable {
         case .rect: "Rectangle"
         case .roundedRect: "Rounded Rectangle"
         case .ellipse: "Ellipse"
+        case .triangle: "Triangle"
+        case .star: "Star"
         case .line: "Line"
         case .arrow: "Arrow"
         }
@@ -1091,6 +1576,8 @@ private enum ShapeKindPreset: String, CaseIterable, Identifiable {
         case .rect: "rectangle"
         case .roundedRect: "rectangle.roundedtop"
         case .ellipse: "circle"
+        case .triangle: "triangle"
+        case .star: "star"
         case .line: "line.diagonal"
         case .arrow: "arrow.up.right"
         }
@@ -1101,6 +1588,8 @@ private enum ShapeKindPreset: String, CaseIterable, Identifiable {
         case (.rect, .rect): true
         case (.roundedRect, .roundedRect): true
         case (.ellipse, .ellipse): true
+        case (.triangle, .triangle): true
+        case (.star, .star): true
         case (.line, .line): true
         case (.arrow, .arrow): true
         default: false
@@ -1114,6 +1603,8 @@ private enum ShapeKindPreset: String, CaseIterable, Identifiable {
             if case .roundedRect(let r) = current { return .roundedRect(cornerRadius: r) }
             return .roundedRect(cornerRadius: 12)
         case .ellipse: return .ellipse
+        case .triangle: return .triangle
+        case .star: return .star
         case .line: return .line
         case .arrow: return .arrow
         }

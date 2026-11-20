@@ -16,4 +16,5 @@ public struct TrayDocumentTransfer: Transferable, Sendable, Codable, Hashable {
 
 extension UTType {
     public static let recorteTrayDocument = UTType(exportedAs: "dev.recorte.tray-document", conformingTo: .data)
+    public static let recorteProject = UTType(exportedAs: "dev.recorte.project", conformingTo: .package)
 }

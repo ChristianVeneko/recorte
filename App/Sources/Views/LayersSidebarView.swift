@@ -203,6 +203,13 @@ private struct LayerRowView: View {
                         .foregroundStyle(spec.tintColor.swiftUIColor)
                 }
             }
+        case .drawing(let spec):
+            ZStack {
+                Color(nsColor: .controlBackgroundColor)
+                Image(systemName: "paintbrush.pointed")
+                    .font(.system(size: 12))
+                    .foregroundStyle((spec.strokes.last?.color ?? .red).swiftUIColor)
+            }
         default:
             ZStack {
                 Color(nsColor: .controlBackgroundColor)

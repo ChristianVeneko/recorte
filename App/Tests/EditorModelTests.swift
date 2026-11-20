@@ -270,4 +270,231 @@ struct EditorModelTests {
         #expect(!model.isRemovingBackground)
         #expect(model.lastErrorMessage != nil)
     }
+
+    @Test("S13: Save/Open .recorte project preserves layers, PDF export writes PDF, Save to Downloads writes file")
+    func projectPersistencePDFAndDownloads() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RecorteT7-S13-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let model = EditorModel()
+        model.pasteImage(ImportedImage(image: makeSolidImage(width: 240, height: 180, r: 50, g: 120, b: 220), suggestedName: "Photo"))
+        model.addTextLayer(TextSpec(string: "Saved Note"))
+        model.commitBrushStroke(points: [CGPoint(x: 10, y: 10), CGPoint(x: 60, y: 40)], color: .red, lineWidth: 5.0)
+
+        let projectURL = tempDir.appendingPathComponent("Sample.recorte")
+        try model.saveProject(to: projectURL)
+        #expect(model.projectURL == projectURL)
+
+        let loaded = EditorModel()
+        try loaded.loadProject(from: projectURL)
+        #expect(loaded.document.canvasSize == CGSize(width: 240, height: 180))
+        #expect(loaded.document.layers.count == 3)
+        #expect(loaded.projectURL == projectURL)
+
+        let pdfURL = tempDir.appendingPathComponent("Output.pdf")
+        try loaded.exportPDF(to: pdfURL)
+        let pdfData = try Data(contentsOf: pdfURL)
+        #expect(pdfData.starts(with: Data("%PDF".utf8)))
+
+        let downloadsDir = tempDir.appendingPathComponent("Downloads", isDirectory: true)
+        try FileManager.default.createDirectory(at: downloadsDir, withIntermediateDirectories: true)
+        let saved1 = try loaded.saveToDownloads(format: .png, directory: downloadsDir)
+        let saved2 = try loaded.saveToDownloads(format: .png, directory: downloadsDir)
+        #expect(FileManager.default.fileExists(atPath: saved1.path))
+        #expect(FileManager.default.fileExists(atPath: saved2.path))
+        #expect(saved1.lastPathComponent != saved2.lastPathComponent)
+    }
+
+    @Test("S15: Lasso, Clone, Perspective, Deform, Curves, Resize, Rotate 90, and Flip edit and undo cleanly")
+    func imageToolsEditAndUndo() throws {
+        let model = EditorModel()
+        let baseImg = makeSolidImage(width: 200, height: 100, r: 80, g: 120, b: 180)
+        model.pasteImage(ImportedImage(image: baseImg, suggestedName: "Base"))
+        let layerID = model.document.layers[0].id
+
+        // Resize with keepAspect
+        try model.resizeDocument(to: CGSize(width: 100, height: 100), keepAspect: true)
+        #expect(model.document.canvasSize == CGSize(width: 100, height: 50))
+        model.undo()
+        #expect(model.document.canvasSize == CGSize(width: 200, height: 100))
+
+        // Rotate 90 right & undo
+        try model.rotateDocument90(direction: .right90)
+        #expect(model.document.canvasSize == CGSize(width: 100, height: 200))
+        model.undo()
+        #expect(model.document.canvasSize == CGSize(width: 200, height: 100))
+
+        // Flip horizontal & undo
+        try model.flipDocument(axis: .horizontal)
+        #expect(model.document.canvasSize == CGSize(width: 200, height: 100))
+        model.undo()
+
+        // Tone curve & undo
+        let brightCurve = ToneCurveSpec(
+            point0: CGPoint(x: 0.0, y: 0.0),
+            point1: CGPoint(x: 0.25, y: 0.4),
+            point2: CGPoint(x: 0.5, y: 0.7),
+            point3: CGPoint(x: 0.75, y: 0.9),
+            point4: CGPoint(x: 1.0, y: 1.0)
+        )
+        try model.applyToneCurve(brightCurve, to: layerID)
+        let afterCurveDoc = model.document
+        model.undo()
+        #expect(model.document != afterCurveDoc)
+
+        // Deform & undo
+        try model.applyDeform(preset: .twirl, center: CGPoint(x: 100, y: 50), radius: 40, strength: 0.5)
+        let afterDeformDoc = model.document
+        model.undo()
+        #expect(model.document != afterDeformDoc)
+
+        // Clone stamp & undo
+        try model.applyCloneStamp(from: CGPoint(x: 40, y: 40), to: CGPoint(x: 120, y: 60), radius: 15)
+        let afterCloneDoc = model.document
+        model.undo()
+        #expect(model.document != afterCloneDoc)
+
+        // Perspective & undo
+        model.beginPerspective()
+        #expect(model.perspectiveQuad != nil)
+        model.perspectiveQuad = PerspectiveQuad(
+            topLeft: CGPoint(x: 10, y: 10),
+            topRight: CGPoint(x: 190, y: 10),
+            bottomRight: CGPoint(x: 180, y: 90),
+            bottomLeft: CGPoint(x: 20, y: 90)
+        )
+        try model.applyPerspective()
+        #expect(model.perspectiveQuad == nil)
+        let afterPerspDoc = model.document
+        model.undo()
+        #expect(model.document != afterPerspDoc)
+
+        // Lasso cutout & undo
+        let lassoPoints = [
+            CGPoint(x: 40, y: 20),
+            CGPoint(x: 160, y: 20),
+            CGPoint(x: 160, y: 80),
+            CGPoint(x: 40, y: 80)
+        ]
+        try model.applyLassoCutout(points: lassoPoints, cropToBounds: true)
+        if case .image(let cutImg) = model.selectedLayer?.kind {
+            #expect(cutImg.width == 120)
+            #expect(cutImg.height == 60)
+        } else {
+            Issue.record("Expected cropped image layer after lasso cutout")
+        }
+        model.undo()
+        if case .image(let restoredImg) = model.selectedLayer?.kind {
+            #expect(restoredImg.width == 200)
+            #expect(restoredImg.height == 100)
+        } else {
+            Issue.record("Expected original image layer after undo")
+        }
+    }
+
+    @Test("S16: Text gradient fill and speech bubble style update and undo cleanly")
+    func textGradientAndBubbleWork() {
+        let model = EditorModel()
+        model.addTextLayer(TextSpec(string: "Hello"))
+        let layerID = model.document.layers[0].id
+
+        var styled = TextSpec(string: "Wow!")
+        styled.gradient = TextGradientSpec(colors: [.red, .yellow], angleDegrees: 45)
+        styled.bubble = .speech
+        styled.bubbleColor = .white
+        styled.bubbleStrokeColor = .black
+        styled.bubbleStrokeWidth = 3.0
+
+        model.updateTextSpec(styled, for: layerID)
+        if case .text(let spec) = model.document.layer(id: layerID)?.kind {
+            #expect(spec.gradient?.colors.count == 2)
+            #expect(spec.bubble == .speech)
+            #expect(spec.bubbleStrokeWidth == 3.0)
+        } else {
+            Issue.record("Expected text layer")
+        }
+        #expect(model.renderedImage != nil)
+
+        model.undo()
+        if case .text(let spec) = model.document.layer(id: layerID)?.kind {
+            #expect(spec.gradient == nil)
+            #expect(spec.bubble == .none)
+        } else {
+            Issue.record("Expected original text layer after undo")
+        }
+    }
+
+    @Test("S17: Drawing tool kinds, image frames, and triangle/star shapes work and undo")
+    func drawingToolsFramesAndShapesWork() {
+        let model = EditorModel()
+        model.pasteImage(ImportedImage(image: makeSolidImage(width: 200, height: 200), suggestedName: "Pic"))
+        let imgID = model.document.layers[0].id
+
+        model.setImageFrame(.polaroid(caption: "Summer", borderColor: .white), for: imgID)
+        if case .image(let img) = model.document.layer(id: imgID)?.kind {
+            #expect(img.frame == .polaroid(caption: "Summer", borderColor: .white))
+        } else {
+            Issue.record("Expected image layer")
+        }
+        model.undo()
+        if case .image(let img) = model.document.layer(id: imgID)?.kind {
+            #expect(img.frame == .none)
+        }
+
+        // Drawing tool with brush/marker/highlighter creates a LayerKind.drawing layer
+        model.drawingToolKind = .highlighter
+        model.commitBrushStroke(points: [CGPoint(x: 20, y: 20), CGPoint(x: 100, y: 40)], color: .yellow, lineWidth: 16)
+        if case .drawing(let drawingSpec) = model.selectedLayer?.kind {
+            #expect(drawingSpec.strokes.count == 1)
+            #expect(drawingSpec.strokes[0].tool == .highlighter)
+        } else {
+            Issue.record("Expected LayerKind.drawing layer")
+        }
+
+        // Basic Paint shapes including triangle and star
+        model.addShapeLayer(ShapeSpec(kind: .triangle))
+        #expect(model.selectedLayer?.name == "Triangle")
+        model.addShapeLayer(ShapeSpec(kind: .star))
+        #expect(model.selectedLayer?.name == "Star")
+        #expect(model.renderedImage != nil)
+    }
+
+    @Test("S18: Collage grid layout populates cells and Free Style creates a blank canvas")
+    func collageLayoutsAndFreeStyleWork() throws {
+        let model = EditorModel()
+        let imgs = [
+            makeSolidImage(width: 100, height: 100, r: 255, g: 0, b: 0),
+            makeSolidImage(width: 100, height: 100, r: 0, g: 255, b: 0),
+            makeSolidImage(width: 100, height: 100, r: 0, g: 0, b: 255),
+            makeSolidImage(width: 100, height: 100, r: 255, g: 255, b: 0)
+        ]
+
+        try model.createCollage(
+            layout: .fourGrid,
+            images: imgs,
+            canvasSize: CGSize(width: 600, height: 600),
+            background: .solid(.white),
+            spacing: 12,
+            cornerRadius: 8
+        )
+        #expect(model.document.canvasSize == CGSize(width: 600, height: 600))
+        #expect(model.document.layers.count == 4)
+        #expect(model.renderedImage?.width == 600)
+
+        try model.createCollage(
+            layout: .freeStyle,
+            images: [],
+            canvasSize: CGSize(width: 800, height: 600),
+            background: .solid(.white)
+        )
+        #expect(model.document.canvasSize == CGSize(width: 800, height: 600))
+        #expect(model.document.layers.isEmpty)
+
+        // Undo restores the 4-cell collage
+        model.undo()
+        #expect(model.document.layers.count == 4)
+        #expect(model.document.canvasSize == CGSize(width: 600, height: 600))
+    }
 }

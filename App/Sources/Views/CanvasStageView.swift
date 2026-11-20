@@ -23,7 +23,7 @@ struct CanvasStageView: View {
                 Color(nsColor: .underPageBackgroundColor)
                     .ignoresSafeArea()
 
-                if model.isEmpty {
+                if !model.hasCanvasSurface {
                     emptyStateView
                 } else {
                     ZStack {
@@ -71,6 +71,31 @@ struct CanvasStageView: View {
                                 canvasFrame: layout.frame,
                                 displayScale: layout.scale
                             )
+                        } else if model.activeTool == .lasso {
+                            LassoOverlayView(
+                                model: model,
+                                canvasFrame: layout.frame,
+                                displayScale: layout.scale
+                            )
+                        } else if model.activeTool == .perspective, let quad = model.perspectiveQuad {
+                            PerspectiveOverlayView(
+                                model: model,
+                                quad: quad,
+                                canvasFrame: layout.frame,
+                                displayScale: layout.scale
+                            )
+                        } else if model.activeTool == .clone {
+                            CloneStampOverlayView(
+                                model: model,
+                                canvasFrame: layout.frame,
+                                displayScale: layout.scale
+                            )
+                        } else if model.activeTool == .deform {
+                            DeformOverlayView(
+                                model: model,
+                                canvasFrame: layout.frame,
+                                displayScale: layout.scale
+                            )
                         } else if model.activeTool == .draw {
                             DrawingOverlayView(
                                 model: model,
@@ -113,35 +138,20 @@ struct CanvasStageView: View {
                     }
                 }
 
-                // Non-intrusive error toast
+                // Non-intrusive error or status toast
                 if let errorMessage = model.lastErrorMessage {
-                    VStack {
-                        HStack(spacing: 8) {
-                            Image(systemName: "exclamationmark.triangle.fill")
-                                .foregroundStyle(.yellow)
-                            Text(errorMessage)
-                                .font(.callout)
-                            Button {
-                                model.lastErrorMessage = nil
-                            } label: {
-                                Image(systemName: "xmark")
-                                    .font(.caption)
-                            }
-                            .buttonStyle(.plain)
-                        }
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 8)
-                        .background(.regularMaterial, in: Capsule())
-                        .shadow(color: .black.opacity(0.2), radius: 8, y: 2)
-                        .padding(.top, 14)
-                        Spacer()
+                    toastBanner(icon: "exclamationmark.triangle.fill", iconColor: .yellow, message: errorMessage) {
+                        model.lastErrorMessage = nil
                     }
-                    .transition(.move(edge: .top).combined(with: .opacity))
+                } else if let statusMessage = model.statusMessage {
+                    toastBanner(icon: "checkmark.circle.fill", iconColor: .green, message: statusMessage) {
+                        model.statusMessage = nil
+                    }
                 }
             }
             .coordinateSpace(name: "canvasStage")
             .onDrop(of: [.recorteTrayDocument, .fileURL, .image], isTargeted: $isDropTargeted) { providers, location in
-                let canvasPt: CGPoint? = model.isEmpty ? nil : CGPoint(
+                let canvasPt: CGPoint? = !model.hasCanvasSurface ? nil : CGPoint(
                     x: (location.x - layout.frame.minX) / max(layout.scale, 0.01),
                     y: (location.y - layout.frame.minY) / max(layout.scale, 0.01)
                 )
@@ -150,11 +160,34 @@ struct CanvasStageView: View {
         }
     }
 
+    private func toastBanner(icon: String, iconColor: Color, message: String, onDismiss: @escaping () -> Void) -> some View {
+        VStack {
+            HStack(spacing: 8) {
+                Image(systemName: icon)
+                    .foregroundStyle(iconColor)
+                Text(message)
+                    .font(.callout)
+                Button(action: onDismiss) {
+                    Image(systemName: "xmark")
+                        .font(.caption)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .background(.regularMaterial, in: Capsule())
+            .shadow(color: .black.opacity(0.2), radius: 8, y: 2)
+            .padding(.top, 14)
+            Spacer()
+        }
+        .transition(.move(edge: .top).combined(with: .opacity))
+    }
+
     private var emptyStateView: some View {
         ContentUnavailableView {
             Label("Paste a Screenshot or Drop an Image", systemImage: "photo.badge.plus")
         } description: {
-            Text("Press ⌘V to paste from your clipboard, drag image files here, or open a file.")
+            Text("Press ⌘V to paste from your clipboard, drag image files here, or open a file or .recorte project.")
         } actions: {
             HStack(spacing: 10) {
                 Button("Paste Screenshot") {
@@ -162,8 +195,13 @@ struct CanvasStageView: View {
                 }
                 .buttonStyle(.borderedProminent)
 
-                Button("Open Image…") {
+                Button("Open…") {
                     onOpenFile()
+                }
+                .buttonStyle(.bordered)
+
+                Button("New Collage…") {
+                    model.isPresentingCollageSheet = true
                 }
                 .buttonStyle(.bordered)
             }
@@ -183,7 +221,7 @@ struct CanvasStageView: View {
 
         let leftInset: CGFloat = 76
         let rightInset: CGFloat = 28
-        let topInset: CGFloat = model.activeTool == .crop ? 64 : 28
+        let topInset: CGFloat = (model.activeTool == .crop || model.activeTool == .perspective || model.activeTool == .lasso) ? 64 : 28
         let bottomInset: CGFloat = showTray ? 104 : 28
 
         let availW = max(80, stageSize.width - leftInset - rightInset)
@@ -210,6 +248,7 @@ struct CanvasStageView: View {
     private func handleDrop(providers: [NSItemProvider], canvasPoint: CGPoint?) -> Bool {
         guard !providers.isEmpty else { return false }
         let trayTypeID = UTType.recorteTrayDocument.identifier
+        let fileURLTypeID = UTType.fileURL.identifier
         for provider in providers {
             let boxedProvider = UncheckedProviderBox(provider: provider)
             if provider.hasItemConformingToTypeIdentifier(trayTypeID) {
@@ -224,6 +263,26 @@ struct CanvasStageView: View {
                             from: workspace,
                             at: canvasPoint
                         )
+                    }
+                }
+            } else if provider.hasItemConformingToTypeIdentifier(fileURLTypeID) {
+                boxedProvider.provider.loadDataRepresentation(forTypeIdentifier: fileURLTypeID) { data, _ in
+                    guard let data, let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
+                    Task { @MainActor in
+                        if url.pathExtension.lowercased() == RecorteProject.fileExtension {
+                            do {
+                                try model.loadProject(from: url)
+                            } catch {
+                                model.lastErrorMessage = "Could not open project \(url.lastPathComponent)."
+                            }
+                        } else {
+                            do {
+                                let imported = try ImageImporter.importFromURL(url)
+                                model.importDroppedImage(imported, at: canvasPoint)
+                            } catch {
+                                model.lastErrorMessage = "Could not import \(url.lastPathComponent)."
+                            }
+                        }
                     }
                 }
             } else {

@@ -3,10 +3,21 @@ import SwiftUI
 struct GlassToolDockView: View {
     @Bindable var model: EditorModel
 
+    private let imageTools: [EditorTool] = [.move, .crop, .lasso, .perspective, .clone, .deform]
+    private let createTools: [EditorTool] = [.text, .shapes, .stickers, .draw]
+
     var body: some View {
-        GlassEffectContainer(spacing: 6) {
-            VStack(spacing: 6) {
-                ForEach(EditorTool.allCases) { tool in
+        GlassEffectContainer(spacing: 4) {
+            VStack(spacing: 4) {
+                ForEach(imageTools) { tool in
+                    toolButton(for: tool)
+                }
+
+                Divider()
+                    .frame(width: 22)
+                    .padding(.vertical, 2)
+
+                ForEach(createTools) { tool in
                     toolButton(for: tool)
                 }
 
@@ -25,10 +36,10 @@ struct GlassToolDockView: View {
                                 .controlSize(.small)
                         } else {
                             Image(systemName: "person.and.background.dotted")
-                                .font(.system(size: 14, weight: .medium))
+                                .font(.system(size: 13, weight: .medium))
                         }
                     }
-                    .frame(width: 34, height: 34)
+                    .frame(width: 32, height: 32)
                 }
                 .buttonStyle(.plain)
                 .background(Color.clear, in: Circle())
@@ -49,27 +60,34 @@ struct GlassToolDockView: View {
         } else {
             tool.label
         }
+        let requiresImageLayer = (tool == .lasso || tool == .perspective || tool == .clone || tool == .deform)
+        let isDisabled = (tool == .crop && !model.hasCanvasSurface) || (requiresImageLayer && !model.hasEditableImageLayer)
 
         return Button {
-            if tool == .crop {
-                if !model.isEmpty {
+            switch tool {
+            case .crop:
+                if model.hasCanvasSurface {
                     model.beginCrop()
                 }
-            } else {
+            case .perspective:
+                if model.hasEditableImageLayer {
+                    model.beginPerspective()
+                }
+            default:
                 model.activeTool = tool
             }
         } label: {
             Image(systemName: tool.systemImage)
-                .font(.system(size: 14, weight: isSelected ? .semibold : .regular))
+                .font(.system(size: 13, weight: isSelected ? .semibold : .regular))
                 .foregroundStyle(isSelected ? Color.white : Color.primary)
-                .frame(width: 34, height: 34)
+                .frame(width: 32, height: 32)
                 .background(
                     isSelected ? Color.accentColor : Color.clear,
                     in: Circle()
                 )
         }
         .buttonStyle(.plain)
-        .disabled(tool == .crop && model.isEmpty)
+        .disabled(isDisabled)
         .help(helpText)
         .accessibilityLabel(tool.label)
         .accessibilityAddTraits(isSelected ? .isSelected : [])

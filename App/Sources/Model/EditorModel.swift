@@ -21,17 +21,36 @@ public final class EditorModel: Identifiable {
             } else if oldValue == .crop {
                 cropSpec = nil
             }
+
+            if activeTool == .perspective {
+                if perspectiveQuad == nil {
+                    initializePerspectiveQuad()
+                }
+            } else if oldValue == .perspective {
+                perspectiveQuad = nil
+            }
+
+            if oldValue == .lasso && activeTool != .lasso {
+                lassoPoints = []
+            }
         }
     }
     public var cropSpec: CropSpec?
     public var renderedImage: CGImage?
     public var isRemovingBackground: Bool = false
     public var lastErrorMessage: String?
+    public var statusMessage: String?
+    public var projectURL: URL?
     public var undoManager: UndoManager
+
+    // Sheet presentation triggers (for menus)
+    public var isPresentingResizeSheet: Bool = false
+    public var isPresentingCollageSheet: Bool = false
 
     // Tool creation defaults
     public var brushColor: RGBAColor = .red
     public var brushLineWidth: Double = 6.0
+    public var drawingToolKind: DrawingToolKind = .brush
     public var defaultTextSpec: TextSpec = TextSpec(
         string: "Double-click or edit text",
         fontName: "HelveticaNeue-Bold",
@@ -51,6 +70,19 @@ public final class EditorModel: Identifiable {
     public var defaultStickerPointSize: Double = 72.0
     public var defaultStickerTint: RGBAColor = .white
 
+    // S15 interactive image tool state
+    public var lassoPoints: [CGPoint] = []
+    public var lassoCropToBounds: Bool = true
+    public var cloneSourcePoint: CGPoint?
+    public var cloneRadius: Double = 24.0
+    public var cloneSoftness: Double = 0.5
+    public var cloneOpacity: Double = 1.0
+    public var perspectiveQuad: PerspectiveQuad?
+    public var deformPreset: DeformPreset = .bump
+    public var deformRadius: Double = 80.0
+    public var deformStrength: Double = 0.5
+    public var toneCurve: ToneCurveSpec = ToneCurveSpec()
+
     private var continuousEditStartDocument: EditorDocument?
 
     public init(
@@ -63,13 +95,17 @@ public final class EditorModel: Identifiable {
         self.title = title
         self.document = document
         self.undoManager = undoManager
-        if !document.layers.isEmpty {
+        if !document.layers.isEmpty || document.background != .transparent {
             rerender()
         }
     }
 
     public var isEmpty: Bool {
         document.layers.isEmpty
+    }
+
+    public var hasCanvasSurface: Bool {
+        !document.layers.isEmpty || document.background != .transparent
     }
 
     public var canvasCenter: CGPoint {
@@ -87,7 +123,11 @@ public final class EditorModel: Identifiable {
 
     public var canRemoveBackground: Bool {
         guard !isRemovingBackground else { return false }
-        return targetImageLayerForBackgroundRemoval() != nil
+        return targetImageLayer() != nil
+    }
+
+    public var hasEditableImageLayer: Bool {
+        targetImageLayer() != nil
     }
 
     // MARK: - Undo / Redo
@@ -130,6 +170,10 @@ public final class EditorModel: Identifiable {
         title = titleSnapshot
         if activeTool == .crop {
             cropSpec = nil
+            activeTool = .move
+        }
+        if activeTool == .perspective {
+            perspectiveQuad = nil
             activeTool = .move
         }
         rerender()
@@ -186,6 +230,90 @@ public final class EditorModel: Identifiable {
         return renderedImage
     }
 
+    // MARK: - S13: .recorte Projects, PDF Export, Save to Downloads
+
+    public func saveProject(to url: URL) throws {
+        let packageURL = url.pathExtension.lowercased() == RecorteProject.fileExtension
+            ? url
+            : url.appendingPathExtension(RecorteProject.fileExtension)
+        try RecorteProject.save(document, to: packageURL)
+        projectURL = packageURL
+        let baseName = packageURL.deletingPathExtension().lastPathComponent
+        if !baseName.isEmpty {
+            title = baseName
+        }
+        statusMessage = "Saved \(packageURL.lastPathComponent)"
+    }
+
+    public func loadProject(from url: URL) throws {
+        let loadedDocument = try RecorteProject.load(from: url)
+        let previousDoc = document
+        let previousTitle = title
+        let baseName = url.deletingPathExtension().lastPathComponent
+        let newTitle = baseName.isEmpty ? "Untitled" : baseName
+
+        cropSpec = nil
+        perspectiveQuad = nil
+        lassoPoints = []
+        activeTool = .move
+        document = loadedDocument
+        title = newTitle
+        projectURL = url
+        rerender()
+
+        registerUndoSnapshot(previousDoc: previousDoc, previousTitle: previousTitle, actionName: "Open Project")
+    }
+
+    public func exportPDF(to url: URL) throws {
+        guard hasCanvasSurface else {
+            throw RecorteProjectError.pdfCreationFailed
+        }
+        try RecorteProject.exportPDF(document, to: url, scale: 1.0)
+        statusMessage = "Exported \(url.lastPathComponent)"
+    }
+
+    @discardableResult
+    public func saveToDownloads(
+        format: ImageExportFormat = .png,
+        directory: URL? = nil
+    ) throws -> URL {
+        guard let composite = renderComposite() else {
+            throw ImageExportError.encodingFailed
+        }
+        let targetDir: URL
+        if let directory {
+            targetDir = directory
+        } else if let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first {
+            targetDir = downloads
+        } else {
+            throw ImageExportError.writeFailed(URL(fileURLWithPath: "/Downloads"))
+        }
+
+        let sanitized = sanitizeFilename(title)
+        let ext = format.fileExtension
+        let destination = uniqueURL(in: targetDir, baseName: sanitized, fileExtension: ext)
+        try ImageExporter.export(composite, to: destination, format: format)
+        statusMessage = "Saved to Downloads: \(destination.lastPathComponent)"
+        return destination
+    }
+
+    private func sanitizeFilename(_ raw: String) -> String {
+        let invalid = CharacterSet(charactersIn: "/\\:*?\"<>|").union(.newlines)
+        let cleaned = raw.components(separatedBy: invalid).joined(separator: "-").trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty ? "Recorte" : cleaned
+    }
+
+    private func uniqueURL(in directory: URL, baseName: String, fileExtension: String) -> URL {
+        let fm = FileManager.default
+        var candidate = directory.appendingPathComponent("\(baseName).\(fileExtension)")
+        var counter = 2
+        while fm.fileExists(atPath: candidate.path) {
+            candidate = directory.appendingPathComponent("\(baseName) \(counter).\(fileExtension)")
+            counter += 1
+        }
+        return candidate
+    }
+
     // MARK: - Input: Paste, Open, Drop
 
     public func pasteImage(_ imported: ImportedImage) {
@@ -195,6 +323,14 @@ public final class EditorModel: Identifiable {
     public func pasteFromPasteboard(_ pasteboard: NSPasteboard = .general) throws {
         let imported = try ImageImporter.importFromPasteboard(pasteboard)
         pasteImage(imported)
+    }
+
+    public func openFile(from url: URL) throws {
+        if url.pathExtension.lowercased() == RecorteProject.fileExtension {
+            try loadProject(from: url)
+        } else {
+            try openImage(from: url)
+        }
     }
 
     public func openImage(from url: URL) throws {
@@ -213,7 +349,7 @@ public final class EditorModel: Identifiable {
         var nextDoc = document
         let cgImage = imported.image
 
-        if nextDoc.layers.isEmpty {
+        if nextDoc.layers.isEmpty && nextDoc.background == .transparent {
             let newSize = CGSize(width: cgImage.width, height: cgImage.height)
             nextDoc.canvasSize = newSize
             let layer = Layer(
@@ -265,7 +401,7 @@ public final class EditorModel: Identifiable {
     }
 
     public func beginCrop() {
-        guard !isEmpty else { return }
+        guard hasCanvasSurface else { return }
         activeTool = .crop
         initializeCropSpec()
     }
@@ -359,6 +495,381 @@ public final class EditorModel: Identifiable {
         }
     }
 
+    // MARK: - S15: Image Tools (Lasso, Clone, Perspective, Deform, Curves, Resize, Rotate 90, Flip)
+
+    public func targetImageLayer() -> (Layer, SendableImage)? {
+        if let selected = selectedLayer, !selected.isLocked {
+            switch selected.kind {
+            case .image(let img):
+                return (selected, img)
+            case .text, .shape, .sticker, .drawing:
+                break
+            default:
+                break
+            }
+        }
+        for layer in document.layers.reversed() where !layer.isLocked {
+            switch layer.kind {
+            case .image(let img):
+                return (layer, img)
+            case .text, .shape, .sticker, .drawing:
+                continue
+            default:
+                continue
+            }
+        }
+        return nil
+    }
+
+    public func canvasPointToImagePoint(_ canvasPoint: CGPoint, for layer: Layer, imageSize: CGSize) -> CGPoint {
+        let dx = canvasPoint.x - layer.transform.position.x
+        let dy = canvasPoint.y - layer.transform.position.y
+        let rad = CGFloat(-layer.transform.rotationDegrees) * .pi / 180.0
+        let cosA = cos(rad)
+        let sinA = sin(rad)
+        let rotX = dx * cosA - dy * sinA
+        let rotY = dx * sinA + dy * cosA
+        let sx = abs(layer.transform.scale.width) > 0.0001 ? layer.transform.scale.width : 1.0
+        let sy = abs(layer.transform.scale.height) > 0.0001 ? layer.transform.scale.height : 1.0
+        let localX = rotX / sx
+        let localY = rotY / sy
+        return CGPoint(x: localX + imageSize.width / 2.0, y: localY + imageSize.height / 2.0)
+    }
+
+    public func imagePointToCanvasPoint(_ imagePoint: CGPoint, for layer: Layer, imageSize: CGSize) -> CGPoint {
+        let localX = (imagePoint.x - imageSize.width / 2.0) * layer.transform.scale.width
+        let localY = (imagePoint.y - imageSize.height / 2.0) * layer.transform.scale.height
+        let rad = CGFloat(layer.transform.rotationDegrees) * .pi / 180.0
+        let cosA = cos(rad)
+        let sinA = sin(rad)
+        let rotX = localX * cosA - localY * sinA
+        let rotY = localX * sinA + localY * cosA
+        return CGPoint(x: layer.transform.position.x + rotX, y: layer.transform.position.y + rotY)
+    }
+
+    public func applyLassoCutout(points: [CGPoint], cropToBounds: Bool = true) throws {
+        guard points.count >= 3 else {
+            throw ImageToolError.invalidParameters
+        }
+        guard let (layer, sendableImg) = targetImageLayer() else {
+            throw ImageToolError.invalidParameters
+        }
+
+        let imageSize = sendableImg.size
+        let path = CGMutablePath()
+        let imagePoints = points.map { canvasPointToImagePoint($0, for: layer, imageSize: imageSize) }
+        path.move(to: imagePoints[0])
+        for pt in imagePoints.dropFirst() {
+            path.addLine(to: pt)
+        }
+        path.closeSubpath()
+
+        let cutImage = try ImageTools.lassoCutout(
+            sendableImg.cgImage,
+            path: path,
+            cropToPathBounds: cropToBounds
+        )
+
+        var newPosition = layer.transform.position
+        if cropToBounds {
+            let fullRect = CGRect(origin: .zero, size: imageSize)
+            let clipped = path.boundingBoxOfPath.intersection(fullRect).integral
+            if !clipped.isNull {
+                let croppedCenterInImage = CGPoint(x: clipped.midX, y: clipped.midY)
+                newPosition = imagePointToCanvasPoint(croppedCenterInImage, for: layer, imageSize: imageSize)
+            }
+        }
+
+        lassoPoints = []
+        commitMutation(actionName: "Lasso Cutout") { doc in
+            guard let i = doc.layers.firstIndex(where: { $0.id == layer.id }) else { return }
+            doc.layers[i].kind = .image(SendableImage(
+                cutImage,
+                filterPreset: sendableImg.filterPreset,
+                adjustments: sendableImg.adjustments,
+                frame: sendableImg.frame
+            ))
+            doc.layers[i].transform.position = newPosition
+            doc.selection = layer.id
+        }
+    }
+
+    public func applyCloneStamp(
+        from sourceCanvasPoint: CGPoint,
+        to destinationCanvasPoint: CGPoint,
+        radius: CGFloat,
+        softness: CGFloat = 0.5,
+        opacity: CGFloat = 1.0,
+        continuous: Bool = false
+    ) throws {
+        guard let (layer, sendableImg) = targetImageLayer() else {
+            throw ImageToolError.invalidParameters
+        }
+        let imgSize = sendableImg.size
+        let srcPt = canvasPointToImagePoint(sourceCanvasPoint, for: layer, imageSize: imgSize)
+        let dstPt = canvasPointToImagePoint(destinationCanvasPoint, for: layer, imageSize: imgSize)
+        let avgScale = max(0.01, (abs(layer.transform.scale.width) + abs(layer.transform.scale.height)) / 2.0)
+        let imageRadius = max(1.0, radius / avgScale)
+
+        let stamped = try ImageTools.cloneStamp(
+            sendableImg.cgImage,
+            from: srcPt,
+            to: dstPt,
+            radius: imageRadius,
+            softness: softness,
+            opacity: opacity
+        )
+
+        let updatedSendable = SendableImage(
+            stamped,
+            filterPreset: sendableImg.filterPreset,
+            adjustments: sendableImg.adjustments,
+            frame: sendableImg.frame
+        )
+
+        if continuous {
+            beginContinuousEdit()
+            if let i = document.layers.firstIndex(where: { $0.id == layer.id }) {
+                document.layers[i].kind = .image(updatedSendable)
+                rerender()
+            }
+        } else {
+            commitMutation(actionName: "Clone Stamp") { doc in
+                guard let i = doc.layers.firstIndex(where: { $0.id == layer.id }) else { return }
+                doc.layers[i].kind = .image(updatedSendable)
+            }
+        }
+    }
+
+    private func initializePerspectiveQuad() {
+        guard let (layer, sendableImg) = targetImageLayer() else {
+            perspectiveQuad = nil
+            return
+        }
+        let w = sendableImg.size.width
+        let h = sendableImg.size.height
+        perspectiveQuad = PerspectiveQuad(
+            topLeft: imagePointToCanvasPoint(CGPoint(x: 0, y: 0), for: layer, imageSize: sendableImg.size),
+            topRight: imagePointToCanvasPoint(CGPoint(x: w, y: 0), for: layer, imageSize: sendableImg.size),
+            bottomRight: imagePointToCanvasPoint(CGPoint(x: w, y: h), for: layer, imageSize: sendableImg.size),
+            bottomLeft: imagePointToCanvasPoint(CGPoint(x: 0, y: h), for: layer, imageSize: sendableImg.size)
+        )
+    }
+
+    public func beginPerspective() {
+        guard targetImageLayer() != nil else { return }
+        activeTool = .perspective
+        initializePerspectiveQuad()
+    }
+
+    public func resetPerspective() {
+        initializePerspectiveQuad()
+    }
+
+    public func cancelPerspective() {
+        perspectiveQuad = nil
+        if activeTool == .perspective {
+            activeTool = .move
+        }
+    }
+
+    public func applyPerspective() throws {
+        guard let quad = perspectiveQuad,
+              let (layer, sendableImg) = targetImageLayer() else {
+            throw ImageToolError.invalidParameters
+        }
+        let imgSize = sendableImg.size
+        let localQuad = PerspectiveQuad(
+            topLeft: canvasPointToImagePoint(quad.topLeft, for: layer, imageSize: imgSize),
+            topRight: canvasPointToImagePoint(quad.topRight, for: layer, imageSize: imgSize),
+            bottomRight: canvasPointToImagePoint(quad.bottomRight, for: layer, imageSize: imgSize),
+            bottomLeft: canvasPointToImagePoint(quad.bottomLeft, for: layer, imageSize: imgSize)
+        )
+
+        let rectified = try ImageTools.perspectiveCorrect(sendableImg.cgImage, quad: localQuad)
+        let updatedSendable = SendableImage(
+            rectified,
+            filterPreset: sendableImg.filterPreset,
+            adjustments: sendableImg.adjustments,
+            frame: sendableImg.frame
+        )
+
+        perspectiveQuad = nil
+        activeTool = .move
+        commitMutation(actionName: "Perspective Correction") { doc in
+            guard let i = doc.layers.firstIndex(where: { $0.id == layer.id }) else { return }
+            doc.layers[i].kind = .image(updatedSendable)
+            if doc.layers.count == 1 {
+                let newSize = CGSize(width: rectified.width, height: rectified.height)
+                doc.canvasSize = newSize
+                doc.layers[i].transform = LayerTransform(position: CGPoint(x: newSize.width / 2.0, y: newSize.height / 2.0))
+            }
+        }
+    }
+
+    public func applyDeform(
+        preset: DeformPreset,
+        center canvasCenterPoint: CGPoint,
+        radius: CGFloat,
+        strength: CGFloat = 0.5,
+        continuous: Bool = false
+    ) throws {
+        guard let (layer, sendableImg) = targetImageLayer() else {
+            throw ImageToolError.invalidParameters
+        }
+        let imgSize = sendableImg.size
+        let centerInImage = canvasPointToImagePoint(canvasCenterPoint, for: layer, imageSize: imgSize)
+        let avgScale = max(0.01, (abs(layer.transform.scale.width) + abs(layer.transform.scale.height)) / 2.0)
+        let imageRadius = max(1.0, radius / avgScale)
+
+        let deformed = try ImageTools.deform(
+            sendableImg.cgImage,
+            preset: preset,
+            center: centerInImage,
+            radius: imageRadius,
+            strength: strength
+        )
+        let updatedSendable = SendableImage(
+            deformed,
+            filterPreset: sendableImg.filterPreset,
+            adjustments: sendableImg.adjustments,
+            frame: sendableImg.frame
+        )
+
+        if continuous {
+            beginContinuousEdit()
+            if let i = document.layers.firstIndex(where: { $0.id == layer.id }) {
+                document.layers[i].kind = .image(updatedSendable)
+                rerender()
+            }
+        } else {
+            commitMutation(actionName: "Deform (\(preset.rawValue.capitalized))") { doc in
+                guard let i = doc.layers.firstIndex(where: { $0.id == layer.id }) else { return }
+                doc.layers[i].kind = .image(updatedSendable)
+            }
+        }
+    }
+
+    public func applyToneCurve(_ curve: ToneCurveSpec, to layerID: UUID) throws {
+        guard let layer = document.layer(id: layerID), !layer.isLocked else {
+            throw ImageToolError.invalidParameters
+        }
+        let sendableImg: SendableImage
+        switch layer.kind {
+        case .image(let img):
+            sendableImg = img
+        case .text, .shape, .sticker, .drawing:
+            throw ImageToolError.invalidParameters
+        default:
+            throw ImageToolError.invalidParameters
+        }
+
+        let curved = try ImageTools.applyCurves(sendableImg.cgImage, curve: curve)
+        let updatedSendable = SendableImage(
+            curved,
+            filterPreset: sendableImg.filterPreset,
+            adjustments: sendableImg.adjustments,
+            frame: sendableImg.frame
+        )
+        toneCurve = ToneCurveSpec()
+        commitMutation(actionName: "Apply Tone Curve") { doc in
+            guard let i = doc.layers.firstIndex(where: { $0.id == layerID }) else { return }
+            doc.layers[i].kind = .image(updatedSendable)
+        }
+    }
+
+    public func resizeDocument(to targetSize: CGSize, keepAspect: Bool) throws {
+        guard let composite = renderComposite() else {
+            throw ImageToolError.invalidDimensions
+        }
+        let resized = try ImageTools.resize(composite, to: targetSize, keepAspect: keepAspect)
+        let newSize = CGSize(width: resized.width, height: resized.height)
+
+        commitMutation(actionName: "Resize Image") { doc in
+            doc.canvasSize = newSize
+            let layer = Layer(
+                name: title,
+                kind: .image(SendableImage(resized)),
+                transform: LayerTransform(position: CGPoint(x: newSize.width / 2.0, y: newSize.height / 2.0))
+            )
+            doc.layers = [layer]
+            doc.selection = layer.id
+        }
+    }
+
+    public func rotateDocument90(direction: RotationDirection) throws {
+        guard let composite = renderComposite() else {
+            throw ImageToolError.invalidDimensions
+        }
+        let rotated = try ImageTools.rotate90(composite, direction: direction)
+        let newSize = CGSize(width: rotated.width, height: rotated.height)
+        let actionName = direction == .left90 ? "Rotate 90° Left" : "Rotate 90° Right"
+
+        commitMutation(actionName: actionName) { doc in
+            doc.canvasSize = newSize
+            let layer = Layer(
+                name: title,
+                kind: .image(SendableImage(rotated)),
+                transform: LayerTransform(position: CGPoint(x: newSize.width / 2.0, y: newSize.height / 2.0))
+            )
+            doc.layers = [layer]
+            doc.selection = layer.id
+        }
+    }
+
+    public func flipDocument(axis: FlipAxis) throws {
+        guard let composite = renderComposite() else {
+            throw ImageToolError.invalidDimensions
+        }
+        let flipped = try ImageTools.flip(composite, axis: axis)
+        let newSize = CGSize(width: flipped.width, height: flipped.height)
+        let actionName = axis == .horizontal ? "Flip Horizontal" : "Flip Vertical"
+
+        commitMutation(actionName: actionName) { doc in
+            doc.canvasSize = newSize
+            let layer = Layer(
+                name: title,
+                kind: .image(SendableImage(flipped)),
+                transform: LayerTransform(position: CGPoint(x: newSize.width / 2.0, y: newSize.height / 2.0))
+            )
+            doc.layers = [layer]
+            doc.selection = layer.id
+        }
+    }
+
+    // MARK: - S18: Collage
+
+    public func createCollage(
+        layout: CollageLayout,
+        images: [CGImage],
+        canvasSize: CGSize = CGSize(width: 1200, height: 1200),
+        background: CanvasBackground = .solid(.white),
+        spacing: CGFloat = 12.0,
+        cornerRadius: Double = 0.0
+    ) throws {
+        let collageDoc = try CollageBuilder.makeDocument(
+            layout: layout,
+            images: images,
+            canvasSize: canvasSize,
+            background: background,
+            spacing: spacing,
+            cornerRadius: cornerRadius
+        )
+        let previousDoc = document
+        let previousTitle = title
+
+        cropSpec = nil
+        perspectiveQuad = nil
+        lassoPoints = []
+        activeTool = .move
+        document = collageDoc
+        title = layout == .freeStyle ? "Free Style Canvas" : "Collage"
+        projectURL = nil
+        rerender()
+
+        registerUndoSnapshot(previousDoc: previousDoc, previousTitle: previousTitle, actionName: "New Collage")
+    }
+
     // MARK: - Layer Creation
 
     public func addTextLayer(_ spec: TextSpec? = nil, at position: CGPoint? = nil) {
@@ -385,6 +896,8 @@ public final class EditorModel: Identifiable {
         case .ellipse: "Ellipse"
         case .line: "Line"
         case .arrow: "Arrow"
+        case .triangle: "Triangle"
+        case .star: "Star"
         default: "Shape"
         }
         commitMutation(actionName: "Add \(name)") { doc in
@@ -413,75 +926,39 @@ public final class EditorModel: Identifiable {
         }
     }
 
-    public func commitBrushStroke(points: [CGPoint], color: RGBAColor, lineWidth: Double) {
-        guard !points.isEmpty else { return }
-        guard let strokeImage = rasterizeBrushStroke(
-            points: points,
-            color: color,
-            lineWidth: lineWidth,
-            canvasSize: document.canvasSize
-        ) else {
-            return
-        }
-        let pos = canvasCenter
-        commitMutation(actionName: "Draw Stroke") { doc in
-            let layer = Layer(
-                name: "Drawing",
-                kind: .image(SendableImage(strokeImage)),
-                transform: LayerTransform(position: pos)
-            )
-            doc.add(layer)
-        }
-    }
-
-    private func rasterizeBrushStroke(
+    /// S17: Records a drawing stroke as a native `LayerKind.drawing(DrawingSpec)` layer using `drawingToolKind`.
+    public func commitBrushStroke(
         points: [CGPoint],
         color: RGBAColor,
         lineWidth: Double,
-        canvasSize: CGSize
-    ) -> CGImage? {
-        let width = max(1, Int(canvasSize.width.rounded()))
-        let height = max(1, Int(canvasSize.height.rounded()))
-        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
-        let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
+        tool: DrawingToolKind? = nil
+    ) {
+        guard !points.isEmpty else { return }
+        let resolvedTool = tool ?? drawingToolKind
+        let stroke = DrawingStroke(
+            points: points,
+            color: color,
+            width: max(1.0, lineWidth),
+            tool: resolvedTool
+        )
 
-        guard let ctx = CGContext(
-            data: nil,
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bytesPerRow: width * 4,
-            space: colorSpace,
-            bitmapInfo: bitmapInfo
-        ) else {
-            return nil
-        }
-
-        ctx.clear(CGRect(x: 0, y: 0, width: width, height: height))
-
-        // Flip context vertically so top-left (y-down) canvas points rasterize accurately
-        ctx.translateBy(x: 0, y: CGFloat(height))
-        ctx.scaleBy(x: 1, y: -1)
-
-        ctx.setStrokeColor(color.cgColor)
-        ctx.setFillColor(color.cgColor)
-        ctx.setLineWidth(CGFloat(max(1.0, lineWidth)))
-        ctx.setLineCap(.round)
-        ctx.setLineJoin(.round)
-
-        if points.count == 1, let first = points.first {
-            let radius = CGFloat(max(1.0, lineWidth)) / 2.0
-            ctx.fillEllipse(in: CGRect(x: first.x - radius, y: first.y - radius, width: radius * 2, height: radius * 2))
-        } else {
-            ctx.beginPath()
-            ctx.move(to: points[0])
-            for pt in points.dropFirst() {
-                ctx.addLine(to: pt)
+        commitMutation(actionName: "Draw Stroke") { doc in
+            if let selection = doc.selection,
+               let idx = doc.layers.firstIndex(where: { $0.id == selection }),
+               !doc.layers[idx].isLocked,
+               doc.layers[idx].transform == LayerTransform(position: .zero),
+               case .drawing(var existingSpec) = doc.layers[idx].kind {
+                existingSpec.strokes.append(stroke)
+                doc.layers[idx].kind = .drawing(existingSpec)
+            } else {
+                let layer = Layer(
+                    name: "Drawing",
+                    kind: .drawing(DrawingSpec(strokes: [stroke])),
+                    transform: LayerTransform(position: .zero)
+                )
+                doc.add(layer)
             }
-            ctx.strokePath()
         }
-
-        return ctx.makeImage()
     }
 
     // MARK: - Layer Operations
@@ -604,7 +1081,7 @@ public final class EditorModel: Identifiable {
             case .image(var img):
                 img.filterPreset = preset
                 doc.layers[i].kind = .image(img)
-            case .text, .shape, .sticker:
+            case .text, .shape, .sticker, .drawing:
                 break
             default:
                 break
@@ -623,7 +1100,7 @@ public final class EditorModel: Identifiable {
                 img.adjustments = adjustments
                 document.layers[idx].kind = .image(img)
                 rerender()
-            case .text, .shape, .sticker:
+            case .text, .shape, .sticker, .drawing:
                 break
             default:
                 break
@@ -636,7 +1113,40 @@ public final class EditorModel: Identifiable {
                 case .image(var img):
                     img.adjustments = adjustments
                     doc.layers[i].kind = .image(img)
-                case .text, .shape, .sticker:
+                case .text, .shape, .sticker, .drawing:
+                    break
+                default:
+                    break
+                }
+            }
+        }
+    }
+
+    public func setImageFrame(_ frame: ImageFrame, for layerID: UUID, continuous: Bool = false) {
+        guard let idx = document.layers.firstIndex(where: { $0.id == layerID }),
+              !document.layers[idx].isLocked else { return }
+
+        if continuous {
+            beginContinuousEdit()
+            switch document.layers[idx].kind {
+            case .image(var img):
+                img.frame = frame
+                document.layers[idx].kind = .image(img)
+                rerender()
+            case .text, .shape, .sticker, .drawing:
+                break
+            default:
+                break
+            }
+        } else {
+            commitMutation(actionName: "Change Image Frame") { doc in
+                guard let i = doc.layers.firstIndex(where: { $0.id == layerID }),
+                      !doc.layers[i].isLocked else { return }
+                switch doc.layers[i].kind {
+                case .image(var img):
+                    img.frame = frame
+                    doc.layers[i].kind = .image(img)
+                case .text, .shape, .sticker, .drawing:
                     break
                 default:
                     break
@@ -704,33 +1214,9 @@ public final class EditorModel: Identifiable {
 
     // MARK: - Background Removal (Apple Vision SubjectLifter)
 
-    private func targetImageLayerForBackgroundRemoval() -> (UUID, SendableImage)? {
-        if let selected = selectedLayer, !selected.isLocked {
-            switch selected.kind {
-            case .image(let img):
-                return (selected.id, img)
-            case .text, .shape, .sticker:
-                break
-            default:
-                break
-            }
-        }
-        for layer in document.layers.reversed() where !layer.isLocked {
-            switch layer.kind {
-            case .image(let img):
-                return (layer.id, img)
-            case .text, .shape, .sticker:
-                continue
-            default:
-                continue
-            }
-        }
-        return nil
-    }
-
     public func removeBackgroundFromSelectedLayer() async {
         guard !isRemovingBackground else { return }
-        guard let (layerID, sendableImg) = targetImageLayerForBackgroundRemoval() else {
+        guard let (layer, sendableImg) = targetImageLayer() else {
             lastErrorMessage = "Select an unlocked image layer to remove its background."
             return
         }
@@ -746,11 +1232,12 @@ public final class EditorModel: Identifiable {
             }.value
 
             commitMutation(actionName: "Remove Background") { doc in
-                guard let i = doc.layers.firstIndex(where: { $0.id == layerID }) else { return }
+                guard let i = doc.layers.firstIndex(where: { $0.id == layer.id }) else { return }
                 let updated = SendableImage(
                     lifted,
                     filterPreset: sendableImg.filterPreset,
-                    adjustments: sendableImg.adjustments
+                    adjustments: sendableImg.adjustments,
+                    frame: sendableImg.frame
                 )
                 doc.layers[i].kind = .image(updated)
             }
@@ -795,6 +1282,7 @@ public final class EditorModel: Identifiable {
             throw ImageExportError.encodingFailed
         }
         try ImageExporter.export(composite, to: url, format: format)
+        statusMessage = "Exported \(url.lastPathComponent)"
     }
 
     // MARK: - Layer Geometry & Display Helpers
@@ -815,12 +1303,23 @@ public final class EditorModel: Identifiable {
                 var leading: CGFloat = 0
                 let w = CGFloat(CTLineGetTypographicBounds(line, &ascent, &descent, &leading))
                 let h = ascent + descent
-                return CGSize(width: max(40, w + 16), height: max(28, h + 12))
+                let padW: CGFloat = spec.bubble == .none ? 16 : 36
+                let padH: CGFloat = spec.bubble == .none ? 12 : 28
+                return CGSize(width: max(40, w + padW), height: max(28, h + padH))
             }
             return CGSize(width: 120, height: 40)
         case .sticker(let spec):
             let dim = max(32, CGFloat(spec.pointSize) * 1.25)
             return CGSize(width: dim, height: dim)
+        case .drawing(let spec):
+            let allPts = spec.strokes.flatMap(\.points)
+            guard let first = allPts.first else { return document.canvasSize }
+            var minX = first.x, maxX = first.x, minY = first.y, maxY = first.y
+            for pt in allPts {
+                minX = min(minX, pt.x); maxX = max(maxX, pt.x)
+                minY = min(minY, pt.y); maxY = max(maxY, pt.y)
+            }
+            return CGSize(width: max(32, maxX - minX + 24), height: max(32, maxY - minY + 24))
         default:
             return CGSize(width: 120, height: 120)
         }
@@ -839,6 +1338,8 @@ public final class EditorModel: Identifiable {
             case .ellipse: return "circle"
             case .line: return "line.diagonal"
             case .arrow: return "arrow.up.right"
+            case .triangle: return "triangle"
+            case .star: return "star"
             default: return "square.on.circle"
             }
         case .sticker(let spec):
@@ -846,6 +1347,8 @@ public final class EditorModel: Identifiable {
             case .emoji: return "face.smiling"
             case .sfSymbol(let name): return name
             }
+        case .drawing:
+            return "paintbrush.pointed"
         default:
             return "square.stack.3d.up"
         }
