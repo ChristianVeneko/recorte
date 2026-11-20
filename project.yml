@@ -1,0 +1,62 @@
+name: Recorte
+options:
+  bundleIdPrefix: dev.recorte
+  deploymentTarget:
+    macOS: "26.0"
+  createIntermediateGroups: true
+
+packages:
+  RecorteCore:
+    path: Packages/RecorteCore
+  RecorteIO:
+    path: Packages/RecorteIO
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    MACOSX_DEPLOYMENT_TARGET: "26.0"
+
+targets:
+  Recorte:
+    type: application
+    platform: macOS
+    deploymentTarget: "26.0"
+    sources:
+      - path: App/Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.recorte.app
+        PRODUCT_NAME: Recorte
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_FILE: App/Sources/Info.plist
+        INFOPLIST_KEY_CFBundleDisplayName: Recorte
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.graphics-design
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGNING_ALLOWED: YES
+        COMBINE_HIDPI_IMAGES: YES
+    dependencies:
+      - package: RecorteCore
+      - package: RecorteIO
+    scheme:
+      testTargets:
+        - RecorteTests
+
+  RecorteTests:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "26.0"
+    sources:
+      - path: App/Tests
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.recorte.app.tests
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGNING_ALLOWED: YES
+    dependencies:
+      - target: Recorte
+      - package: RecorteCore
+      - package: RecorteIO
