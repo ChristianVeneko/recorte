@@ -4,6 +4,7 @@ public enum EditorTool: String, CaseIterable, Identifiable, Sendable {
     case move
     case crop
     case lasso
+    case eraser
     case perspective
     case clone
     case deform
@@ -19,6 +20,7 @@ public enum EditorTool: String, CaseIterable, Identifiable, Sendable {
         case .move: "Move"
         case .crop: "Crop"
         case .lasso: "Lasso Cutout"
+        case .eraser: "Eraser"
         case .perspective: "Perspective"
         case .clone: "Clone Stamp"
         case .deform: "Deform"
@@ -34,6 +36,7 @@ public enum EditorTool: String, CaseIterable, Identifiable, Sendable {
         case .move: "cursorarrow"
         case .crop: "crop"
         case .lasso: "lasso"
+        case .eraser: "eraser"
         case .perspective: "perspective"
         case .clone: "seal"
         case .deform: "hurricane"
@@ -49,6 +52,7 @@ public enum EditorTool: String, CaseIterable, Identifiable, Sendable {
         case .move: "V"
         case .crop: "C"
         case .lasso: "L"
+        case .eraser: "E"
         case .perspective: "P"
         case .clone: "K"
         case .deform: "W"

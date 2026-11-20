@@ -3,7 +3,7 @@ import SwiftUI
 struct GlassToolDockView: View {
     @Bindable var model: EditorModel
 
-    private let imageTools: [EditorTool] = [.move, .crop, .lasso, .perspective, .clone, .deform]
+    private let imageTools: [EditorTool] = [.move, .crop, .lasso, .eraser, .perspective, .clone, .deform]
     private let createTools: [EditorTool] = [.text, .shapes, .stickers, .draw]
 
     var body: some View {
@@ -51,6 +51,7 @@ struct GlassToolDockView: View {
             .padding(.vertical, 8)
             .glassEffect(.regular, in: .rect(cornerRadius: 18))
         }
+        .background(EraserShortcutBridge(model: model))
     }
 
     private func toolButton(for tool: EditorTool) -> some View {
@@ -60,7 +61,7 @@ struct GlassToolDockView: View {
         } else {
             tool.label
         }
-        let requiresImageLayer = (tool == .lasso || tool == .perspective || tool == .clone || tool == .deform)
+        let requiresImageLayer = (tool == .lasso || tool == .eraser || tool == .perspective || tool == .clone || tool == .deform)
         let isDisabled = (tool == .crop && !model.hasCanvasSurface) || (requiresImageLayer && !model.hasEditableImageLayer)
 
         return Button {

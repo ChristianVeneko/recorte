@@ -7,12 +7,20 @@ import UniformTypeIdentifiers
 struct CanvasStageView: View {
     @Bindable var model: EditorModel
     let workspace: Workspace
-    @Binding var zoomFactor: CGFloat
     @Binding var showTray: Bool
     let onOpenFile: () -> Void
     let onPaste: () -> Void
 
     @State private var isDropTargeted: Bool = false
+    @State private var pinchStartScale: CGFloat?
+    @State private var pinchStartPan: CGSize?
+
+    private var activeCanvasPointerStyle: PointerStyle? {
+        if model.activeTool == .draw || model.activeTool.rawValue == "eraser" {
+            return CanvasCursors.crosshairPointerStyle
+        }
+        return nil
+    }
 
     var body: some View {
         GeometryReader { proxy in
@@ -22,29 +30,46 @@ struct CanvasStageView: View {
             ZStack {
                 Color(nsColor: .underPageBackgroundColor)
                     .ignoresSafeArea()
+                    .contentShape(Rectangle())
+                    .onTapGesture(count: 2) {
+                        guard model.hasCanvasSurface, model.activeTool == .move else { return }
+                        withAnimation(.snappy(duration: 0.2)) {
+                            model.viewport.toggleSmartZoom(baseCenter: layout.baseCenter)
+                        }
+                    }
 
                 if !model.hasCanvasSurface {
                     emptyStateView
                 } else {
                     ZStack {
-                        // Transparency checkerboard + rendered composite image
-                        CheckerboardView()
-                            .frame(width: layout.frame.width, height: layout.frame.height)
-                            .position(x: layout.frame.midX, y: layout.frame.midY)
-                            .shadow(color: .black.opacity(0.22), radius: 14, y: 4)
+                        // Transparency checkerboard + rendered composite image (or 60fps live GPU transform split)
+                        ZStack {
+                            CheckerboardView()
 
-                        if let rendered = model.renderedImage {
-                            Image(decorative: rendered, scale: 1.0)
-                                .resizable()
-                                .interpolation(.high)
-                                .frame(width: layout.frame.width, height: layout.frame.height)
-                                .position(x: layout.frame.midX, y: layout.frame.midY)
+                            if let preview = model.liveTransformPreview {
+                                liveTransformComposite(preview: preview, layout: layout)
+                            } else if let rendered = model.renderedImage {
+                                Image(decorative: rendered, scale: 1.0)
+                                    .resizable()
+                                    .interpolation(.high)
+                            }
+                        }
+                        .frame(width: layout.frame.width, height: layout.frame.height)
+                        .clipped()
+                        .shadow(color: .black.opacity(0.22), radius: 14, y: 4)
+                        .position(x: layout.frame.midX, y: layout.frame.midY)
+                        .onTapGesture(count: 2) {
+                            guard model.activeTool == .move else { return }
+                            withAnimation(.snappy(duration: 0.2)) {
+                                model.viewport.toggleSmartZoom(baseCenter: layout.baseCenter)
+                            }
                         }
 
                         // Click-to-place for Text / Shapes tools
                         if model.activeTool == .text || model.activeTool == .shapes {
                             Color.clear
                                 .contentShape(Rectangle())
+                                .pointerStyle(CanvasCursors.crosshairPointerStyle)
                                 .onTapGesture(coordinateSpace: .named("canvasStage")) { location in
                                     let canvasPt = CGPoint(
                                         x: (location.x - layout.frame.minX) / max(layout.scale, 0.01),
@@ -102,6 +127,12 @@ struct CanvasStageView: View {
                                 canvasFrame: layout.frame,
                                 displayScale: layout.scale
                             )
+                        } else if model.activeTool == .eraser {
+                            EraserOverlayView(
+                                model: model,
+                                canvasFrame: layout.frame,
+                                displayScale: layout.scale
+                            )
                         } else if let selected = model.selectedLayer, !selected.isHidden {
                             SelectionOverlayView(
                                 model: model,
@@ -111,6 +142,35 @@ struct CanvasStageView: View {
                             )
                         }
                     }
+                    .pointerStyle(activeCanvasPointerStyle)
+                    .simultaneousGesture(
+                        MagnifyGesture()
+                            .onChanged { value in
+                                if pinchStartScale == nil {
+                                    pinchStartScale = model.viewport.effectiveScale
+                                    pinchStartPan = model.viewport.panOffset
+                                }
+                                guard let startScale = pinchStartScale,
+                                      let startPan = pinchStartPan else { return }
+
+                                // Recompute smoothly from gesture start so pointer anchor never drifts
+                                var nextViewport = model.viewport
+                                nextViewport.isFitMode = false
+                                nextViewport.zoomScale = startScale
+                                nextViewport.panOffset = startPan
+                                let targetScale = startScale * value.magnification
+                                nextViewport.zoom(
+                                    to: targetScale,
+                                    around: value.startLocation,
+                                    baseCenter: layout.baseCenter
+                                )
+                                model.viewport = nextViewport
+                            }
+                            .onEnded { _ in
+                                pinchStartScale = nil
+                                pinchStartPan = nil
+                            }
+                    )
                 }
 
                 // Drop target highlight
@@ -149,13 +209,78 @@ struct CanvasStageView: View {
                     }
                 }
             }
+            .background(
+                TrackpadGestureBridge(
+                    onPan: { delta in
+                        guard model.hasCanvasSurface else { return }
+                        model.viewport.pan(by: delta)
+                    },
+                    onSmartZoom: { pointer in
+                        guard model.hasCanvasSurface else { return }
+                        withAnimation(.snappy(duration: 0.2)) {
+                            model.viewport.toggleSmartZoom(around: pointer, baseCenter: layout.baseCenter)
+                        }
+                    },
+                    onRotate: { deltaDegrees, phase in
+                        guard model.hasCanvasSurface else { return }
+                        model.handleTrackpadRotate(deltaDegrees: deltaDegrees, phase: phase)
+                    }
+                )
+            )
             .coordinateSpace(name: "canvasStage")
+            .onAppear {
+                model.viewport.updateFitScale(layout.fitScale)
+            }
+            .onChange(of: layout.fitScale) { _, newFit in
+                model.viewport.updateFitScale(newFit)
+            }
             .onDrop(of: [.recorteTrayDocument, .fileURL, .image], isTargeted: $isDropTargeted) { providers, location in
                 let canvasPt: CGPoint? = !model.hasCanvasSurface ? nil : CGPoint(
                     x: (location.x - layout.frame.minX) / max(layout.scale, 0.01),
                     y: (location.y - layout.frame.minY) / max(layout.scale, 0.01)
                 )
                 return handleDrop(providers: providers, canvasPoint: canvasPt)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func liveTransformComposite(preview: EditorModel.LiveTransformPreview, layout: CanvasLayout) -> some View {
+        let docW = max(1.0, model.document.canvasSize.width)
+        let docH = max(1.0, model.document.canvasSize.height)
+        let start = preview.startTransform
+        let current = preview.currentTransform
+
+        let anchor = UnitPoint(
+            x: start.position.x / docW,
+            y: start.position.y / docH
+        )
+        let dsx = abs(start.scale.width) > 0.0001 ? (current.scale.width / start.scale.width) : 1.0
+        let dsy = abs(start.scale.height) > 0.0001 ? (current.scale.height / start.scale.height) : 1.0
+        let deltaRot = current.rotationDegrees - start.rotationDegrees
+        let deltaOffset = CGSize(
+            width: (current.position.x - start.position.x) * layout.scale,
+            height: (current.position.y - start.position.y) * layout.scale
+        )
+
+        ZStack {
+            if let underlay = preview.split.underlay {
+                Image(decorative: underlay, scale: 1.0)
+                    .resizable()
+                    .interpolation(.high)
+            }
+
+            Image(decorative: preview.split.activeLayerImage, scale: 1.0)
+                .resizable()
+                .interpolation(.high)
+                .scaleEffect(x: dsx, y: dsy, anchor: anchor)
+                .rotationEffect(.degrees(deltaRot), anchor: anchor)
+                .offset(deltaOffset)
+
+            if let overlay = preview.split.overlay {
+                Image(decorative: overlay, scale: 1.0)
+                    .resizable()
+                    .interpolation(.high)
             }
         }
     }
@@ -213,36 +338,30 @@ struct CanvasStageView: View {
     private struct CanvasLayout {
         let frame: CGRect
         let scale: CGFloat
+        let fitScale: CGFloat
+        let baseCenter: CGPoint
     }
 
     private func computeCanvasLayout(in stageSize: CGSize) -> CanvasLayout {
-        let docW = max(1, model.document.canvasSize.width)
-        let docH = max(1, model.document.canvasSize.height)
-
+        let docSize = model.document.canvasSize
         let leftInset: CGFloat = 76
         let rightInset: CGFloat = 28
-        let topInset: CGFloat = (model.activeTool == .crop || model.activeTool == .perspective || model.activeTool == .lasso) ? 64 : 28
+        let topInset: CGFloat = (model.activeTool == .crop || model.activeTool == .perspective || model.activeTool == .lasso || model.activeTool == .eraser) ? 64 : 28
         let bottomInset: CGFloat = showTray ? 104 : 28
 
         let availW = max(80, stageSize.width - leftInset - rightInset)
         let availH = max(80, stageSize.height - topInset - bottomInset)
-
-        let fitScale = min(availW / docW, availH / docH, 1.0)
-        let effectiveScale = max(0.05, fitScale * zoomFactor)
-
-        let renderedW = docW * effectiveScale
-        let renderedH = docH * effectiveScale
-
-        let centerX = leftInset + availW / 2.0
-        let centerY = topInset + availH / 2.0
-
-        let rect = CGRect(
-            x: centerX - renderedW / 2.0,
-            y: centerY - renderedH / 2.0,
-            width: renderedW,
-            height: renderedH
+        let fitScale = CanvasViewport.computeFitScale(
+            documentSize: docSize,
+            availableSize: CGSize(width: availW, height: availH)
         )
-        return CanvasLayout(frame: rect, scale: effectiveScale)
+        let baseCenter = CGPoint(x: leftInset + availW / 2.0, y: topInset + availH / 2.0)
+
+        var resolvedViewport = model.viewport
+        resolvedViewport.lastKnownFitScale = fitScale
+        let effectiveScale = resolvedViewport.effectiveScale
+        let rect = resolvedViewport.canvasFrame(documentSize: docSize, baseCenter: baseCenter)
+        return CanvasLayout(frame: rect, scale: effectiveScale, fitScale: fitScale, baseCenter: baseCenter)
     }
 
     private func handleDrop(providers: [NSItemProvider], canvasPoint: CGPoint?) -> Bool {
