@@ -211,14 +211,19 @@ struct PolishSpecsTests {
         let pdfData = try Data(contentsOf: pdfURL)
         #expect(pdfData.starts(with: Data("%PDF".utf8)))
 
-        // Save and reload .recorte preserves sticker background
+        // Save and reload .recorte via RecorteProject directly preserves StickerSpec.background (no sidecar)
         let projectURL = tempDir.appendingPathComponent("StickerBg.recorte")
         try model.saveProject(to: projectURL)
         let reloaded = EditorModel()
         try reloaded.loadProject(from: projectURL)
         #expect(reloaded.stickerBackground(for: stickerID) == .blue)
+        if case .sticker(let persistedSpec) = reloaded.document.layer(id: stickerID)?.kind {
+            #expect(persistedSpec.background == .blue)
+        } else {
+            Issue.record("Expected persisted sticker layer with background in Core StickerSpec")
+        }
 
-        // Duplicate preserves sticker background
+        // Duplicate preserves StickerSpec.background
         model.duplicateLayer(id: stickerID)
         let dupID = try #require(model.selectedLayer?.id)
         #expect(dupID != stickerID)
@@ -230,6 +235,36 @@ struct PolishSpecsTests {
         #expect(model.stickerBackground(for: stickerID) == nil)
         let undoneRendered = try #require(model.renderedImage)
         #expect(rgbaAt(x: badgeCornerX, y: badgeCornerY, in: undoneRendered).a == 0)
+    }
+
+    @Test("S21: Toggling Solid Background ON picks a contrasting default color for light vs dark sticker tints")
+    func stickerSolidBackgroundContrastsWithTint() throws {
+        // Light tints (white, yellow) -> black background
+        #expect(StickerDisplayName.contrastingBackground(for: .white) == .black)
+        #expect(StickerDisplayName.contrastingBackground(for: .yellow) == .black)
+
+        // Dark tints (black, blue) -> white background
+        #expect(StickerDisplayName.contrastingBackground(for: .black) == .white)
+        #expect(StickerDisplayName.contrastingBackground(for: .blue) == .white)
+
+        let model = EditorModel(document: EditorDocument(canvasSize: CGSize(width: 240, height: 240)))
+
+        // White star sticker -> turning Solid Background ON must pick black, not white!
+        model.addStickerLayer(.sfSymbol("star.fill", pointSize: 80, tintColor: .white))
+        let whiteStarID = try #require(model.selectedLayer?.id)
+        model.toggleStickerSolidBackground(enabled: true, for: whiteStarID)
+        #expect(model.stickerBackground(for: whiteStarID) == .black)
+
+        // Dark blue heart sticker -> turning Solid Background ON must pick white!
+        model.defaultStickerBackground = nil
+        model.addStickerLayer(.sfSymbol("heart.fill", pointSize: 80, tintColor: .blue))
+        let blueHeartID = try #require(model.selectedLayer?.id)
+        model.toggleStickerSolidBackground(enabled: true, for: blueHeartID)
+        #expect(model.stickerBackground(for: blueHeartID) == .white)
+
+        // Turning Solid Background OFF clears background
+        model.toggleStickerSolidBackground(enabled: false, for: blueHeartID)
+        #expect(model.stickerBackground(for: blueHeartID) == nil)
     }
 
     @Test("S21: Emoji sticker solid background also renders and exports")

@@ -222,23 +222,47 @@ public struct StickerSpec: Sendable, Equatable, Hashable, Codable {
     public var content: StickerContent
     public var pointSize: Double
     public var tintColor: RGBAColor
+    public var background: RGBAColor?
 
     public init(
         content: StickerContent,
         pointSize: Double = 64.0,
-        tintColor: RGBAColor = .white
+        tintColor: RGBAColor = .white,
+        background: RGBAColor? = nil
     ) {
         self.content = content
         self.pointSize = pointSize
         self.tintColor = tintColor
+        self.background = background
     }
 
-    public static func emoji(_ value: String, pointSize: Double = 64.0) -> StickerSpec {
-        StickerSpec(content: .emoji(value), pointSize: pointSize)
+    private enum CodingKeys: String, CodingKey {
+        case content, pointSize, tintColor, background
     }
 
-    public static func sfSymbol(_ name: String, pointSize: Double = 64.0, tintColor: RGBAColor = .white) -> StickerSpec {
-        StickerSpec(content: .sfSymbol(name), pointSize: pointSize, tintColor: tintColor)
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.content = try c.decode(StickerContent.self, forKey: .content)
+        self.pointSize = try c.decodeIfPresent(Double.self, forKey: .pointSize) ?? 64.0
+        self.tintColor = try c.decodeIfPresent(RGBAColor.self, forKey: .tintColor) ?? .white
+        self.background = try c.decodeIfPresent(RGBAColor.self, forKey: .background)
+    }
+
+    public static func emoji(
+        _ value: String,
+        pointSize: Double = 64.0,
+        background: RGBAColor? = nil
+    ) -> StickerSpec {
+        StickerSpec(content: .emoji(value), pointSize: pointSize, background: background)
+    }
+
+    public static func sfSymbol(
+        _ name: String,
+        pointSize: Double = 64.0,
+        tintColor: RGBAColor = .white,
+        background: RGBAColor? = nil
+    ) -> StickerSpec {
+        StickerSpec(content: .sfSymbol(name), pointSize: pointSize, tintColor: tintColor, background: background)
     }
 }
 

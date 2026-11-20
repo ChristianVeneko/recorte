@@ -618,6 +618,18 @@ public enum Renderer {
     // MARK: - Sticker Layer
 
     private static func drawStickerLayer(_ spec: StickerSpec, in ctx: CGContext) {
+        if let bg = spec.background {
+            let dim = max(32.0, ceil(CGFloat(spec.pointSize) * 1.45))
+            let badgeRect = CGRect(x: -dim / 2.0, y: -dim / 2.0, width: dim, height: dim)
+            let cornerRadius = dim * 0.22
+            let path = CGPath(roundedRect: badgeRect, cornerWidth: cornerRadius, cornerHeight: cornerRadius, transform: nil)
+            ctx.saveGState()
+            ctx.addPath(path)
+            ctx.setFillColor(bg.cgColor)
+            ctx.fillPath()
+            ctx.restoreGState()
+        }
+
         let text: String
         switch spec.content {
         case .emoji(let emoji):

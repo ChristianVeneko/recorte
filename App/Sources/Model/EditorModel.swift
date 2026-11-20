@@ -70,9 +70,7 @@ public final class EditorModel: Identifiable {
     public var defaultStickerPointSize: Double = 72.0
     public var defaultStickerTint: RGBAColor = .white
     public var defaultStickerBackground: RGBAColor? = nil
-    public var lastSolidStickerBackgroundColor: RGBAColor = .white
     public var lastSolidCanvasBackgroundColor: RGBAColor = .white
-    public var stickerBackgrounds: [UUID: RGBAColor] = [:]
 
     // S24 Viewport & 60fps Live Transform Preview
     public var viewport: CanvasViewport = CanvasViewport()
@@ -93,7 +91,6 @@ public final class EditorModel: Identifiable {
     public var toneCurve: ToneCurveSpec = ToneCurveSpec()
 
     private var continuousEditStartDocument: EditorDocument?
-    private var continuousEditStartStickerBackgrounds: [UUID: RGBAColor]?
 
     public struct LiveTransformPreview: Sendable {
         public let layerID: UUID
@@ -162,10 +159,8 @@ public final class EditorModel: Identifiable {
     private func registerUndoSnapshot(
         previousDoc: EditorDocument,
         previousTitle: String,
-        previousStickerBackgrounds: [UUID: RGBAColor]? = nil,
         actionName: String
     ) {
-        let backgroundsSnapshot = previousStickerBackgrounds ?? stickerBackgrounds
         let shouldManageGroup = !undoManager.isUndoing && !undoManager.isRedoing && undoManager.groupingLevel == 0
         let previousGroupsByEvent = undoManager.groupsByEvent
         if shouldManageGroup {
@@ -177,7 +172,6 @@ public final class EditorModel: Identifiable {
                 target.applyDocumentSnapshot(
                     previousDoc,
                     titleSnapshot: previousTitle,
-                    stickerBackgroundsSnapshot: backgroundsSnapshot,
                     actionName: actionName
                 )
             }
@@ -192,16 +186,13 @@ public final class EditorModel: Identifiable {
     private func applyDocumentSnapshot(
         _ snapshot: EditorDocument,
         titleSnapshot: String,
-        stickerBackgroundsSnapshot: [UUID: RGBAColor],
         actionName: String
     ) {
         let previousDoc = document
         let previousTitle = title
-        let previousBackgrounds = stickerBackgrounds
         liveTransformPreview = nil
         document = snapshot
         title = titleSnapshot
-        stickerBackgrounds = stickerBackgroundsSnapshot
         if activeTool == .crop {
             cropSpec = nil
             activeTool = .move
@@ -215,7 +206,6 @@ public final class EditorModel: Identifiable {
         registerUndoSnapshot(
             previousDoc: previousDoc,
             previousTitle: previousTitle,
-            previousStickerBackgrounds: previousBackgrounds,
             actionName: actionName
         )
     }
@@ -223,7 +213,6 @@ public final class EditorModel: Identifiable {
     private func commitMutation(actionName: String, _ mutation: (inout EditorDocument) -> Void) {
         let previousDoc = document
         let previousTitle = title
-        let previousBackgrounds = stickerBackgrounds
         var nextDoc = document
         mutation(&nextDoc)
         guard nextDoc != previousDoc else { return }
@@ -234,31 +223,6 @@ public final class EditorModel: Identifiable {
         registerUndoSnapshot(
             previousDoc: previousDoc,
             previousTitle: previousTitle,
-            previousStickerBackgrounds: previousBackgrounds,
-            actionName: actionName
-        )
-    }
-
-    private func commitMutationWithState(
-        actionName: String,
-        _ mutation: (inout EditorDocument, inout [UUID: RGBAColor]) -> Void
-    ) {
-        let previousDoc = document
-        let previousTitle = title
-        let previousBackgrounds = stickerBackgrounds
-        var nextDoc = document
-        var nextBackgrounds = stickerBackgrounds
-        mutation(&nextDoc, &nextBackgrounds)
-        guard nextDoc != previousDoc || nextBackgrounds != previousBackgrounds else { return }
-
-        document = nextDoc
-        stickerBackgrounds = nextBackgrounds
-        rerender()
-
-        registerUndoSnapshot(
-            previousDoc: previousDoc,
-            previousTitle: previousTitle,
-            previousStickerBackgrounds: previousBackgrounds,
             actionName: actionName
         )
     }
@@ -266,21 +230,17 @@ public final class EditorModel: Identifiable {
     public func beginContinuousEdit() {
         if continuousEditStartDocument == nil {
             continuousEditStartDocument = document
-            continuousEditStartStickerBackgrounds = stickerBackgrounds
         }
     }
 
     public func endContinuousEdit(actionName: String) {
         guard let startDoc = continuousEditStartDocument else { return }
-        let startBackgrounds = continuousEditStartStickerBackgrounds ?? stickerBackgrounds
         continuousEditStartDocument = nil
-        continuousEditStartStickerBackgrounds = nil
-        guard startDoc != document || startBackgrounds != stickerBackgrounds else { return }
+        guard startDoc != document else { return }
 
         registerUndoSnapshot(
             previousDoc: startDoc,
             previousTitle: title,
-            previousStickerBackgrounds: startBackgrounds,
             actionName: actionName
         )
     }
@@ -316,8 +276,7 @@ public final class EditorModel: Identifiable {
         beginContinuousEdit()
         guard let split = DocumentRenderer.renderLiveTransformSplit(
             document,
-            activeLayerID: layerID,
-            stickerBackgrounds: stickerBackgrounds
+            activeLayerID: layerID
         ) else { return }
 
         liveTransformPreview = LiveTransformPreview(
@@ -399,11 +358,7 @@ public final class EditorModel: Identifiable {
             renderedImage = nil
             return
         }
-        renderedImage = try? DocumentRenderer.render(
-            document,
-            stickerBackgrounds: stickerBackgrounds,
-            scale: 1.0
-        )
+        renderedImage = try? DocumentRenderer.render(document, scale: 1.0)
         renderCount += 1
     }
 
@@ -417,23 +372,11 @@ public final class EditorModel: Identifiable {
 
     // MARK: - S13: .recorte Projects, PDF Export, Save to Downloads
 
-    private static let stickerBackgroundsFilename = "sticker-backgrounds.json"
-
     public func saveProject(to url: URL) throws {
         let packageURL = url.pathExtension.lowercased() == RecorteProject.fileExtension
             ? url
             : url.appendingPathExtension(RecorteProject.fileExtension)
         try RecorteProject.save(document, to: packageURL)
-
-        let bgURL = packageURL.appendingPathComponent(Self.stickerBackgroundsFilename)
-        if stickerBackgrounds.isEmpty {
-            try? FileManager.default.removeItem(at: bgURL)
-        } else {
-            let keyed = Dictionary(uniqueKeysWithValues: stickerBackgrounds.map { ($0.key.uuidString, $0.value) })
-            let data = try JSONEncoder().encode(keyed)
-            try data.write(to: bgURL, options: .atomic)
-        }
-
         projectURL = packageURL
         let baseName = packageURL.deletingPathExtension().lastPathComponent
         if !baseName.isEmpty {
@@ -444,20 +387,8 @@ public final class EditorModel: Identifiable {
 
     public func loadProject(from url: URL) throws {
         let loadedDocument = try RecorteProject.load(from: url)
-        var loadedBackgrounds: [UUID: RGBAColor] = [:]
-        let bgURL = url.appendingPathComponent(Self.stickerBackgroundsFilename)
-        if let data = try? Data(contentsOf: bgURL),
-           let decoded = try? JSONDecoder().decode([String: RGBAColor].self, from: data) {
-            for (key, value) in decoded {
-                if let uuid = UUID(uuidString: key) {
-                    loadedBackgrounds[uuid] = value
-                }
-            }
-        }
-
         let previousDoc = document
         let previousTitle = title
-        let previousBackgrounds = stickerBackgrounds
         let baseName = url.deletingPathExtension().lastPathComponent
         let newTitle = baseName.isEmpty ? "Untitled" : baseName
 
@@ -467,7 +398,6 @@ public final class EditorModel: Identifiable {
         liveTransformPreview = nil
         activeTool = .move
         document = loadedDocument
-        stickerBackgrounds = loadedBackgrounds
         title = newTitle
         projectURL = url
         rerender()
@@ -475,7 +405,6 @@ public final class EditorModel: Identifiable {
         registerUndoSnapshot(
             previousDoc: previousDoc,
             previousTitle: previousTitle,
-            previousStickerBackgrounds: previousBackgrounds,
             actionName: "Open Project"
         )
     }
@@ -484,8 +413,7 @@ public final class EditorModel: Identifiable {
         guard hasCanvasSurface else {
             throw RecorteProjectError.pdfCreationFailed
         }
-        let prepared = DocumentRenderer.prepareForRendering(document, stickerBackgrounds: stickerBackgrounds)
-        try RecorteProject.exportPDF(prepared, to: url, scale: 1.0)
+        try RecorteProject.exportPDF(document, to: url, scale: 1.0)
         statusMessage = "Exported \(url.lastPathComponent)"
     }
 
@@ -683,7 +611,6 @@ public final class EditorModel: Identifiable {
 
         let previousDoc = document
         let previousTitle = title
-        let previousBackgrounds = stickerBackgrounds
 
         var nextDoc = EditorDocument(
             canvasSize: newSize,
@@ -702,13 +629,11 @@ public final class EditorModel: Identifiable {
         liveTransformPreview = nil
         activeTool = .move
         document = nextDoc
-        stickerBackgrounds = [:]
         rerender()
 
         registerUndoSnapshot(
             previousDoc: previousDoc,
             previousTitle: previousTitle,
-            previousStickerBackgrounds: previousBackgrounds,
             actionName: "Crop"
         )
     }
@@ -1082,7 +1007,6 @@ public final class EditorModel: Identifiable {
         )
         let previousDoc = document
         let previousTitle = title
-        let previousBackgrounds = stickerBackgrounds
 
         cropSpec = nil
         perspectiveQuad = nil
@@ -1090,7 +1014,6 @@ public final class EditorModel: Identifiable {
         liveTransformPreview = nil
         activeTool = .move
         document = collageDoc
-        stickerBackgrounds = [:]
         title = layout == .freeStyle ? "Free Style Canvas" : "Collage"
         projectURL = nil
         rerender()
@@ -1098,7 +1021,6 @@ public final class EditorModel: Identifiable {
         registerUndoSnapshot(
             previousDoc: previousDoc,
             previousTitle: previousTitle,
-            previousStickerBackgrounds: previousBackgrounds,
             actionName: "New Collage"
         )
     }
@@ -1140,49 +1062,69 @@ public final class EditorModel: Identifiable {
         background: RGBAColor? = nil
     ) {
         let pos = position ?? canvasCenter
-        let name = StickerDisplayName.layerName(for: spec)
-        let resolvedBackground = background ?? defaultStickerBackground
-        commitMutationWithState(actionName: "Add Sticker") { doc, backgrounds in
+        var resolvedSpec = spec
+        if let background {
+            resolvedSpec.background = background
+        } else if resolvedSpec.background == nil {
+            resolvedSpec.background = defaultStickerBackground
+        }
+        let name = StickerDisplayName.layerName(for: resolvedSpec)
+        commitMutation(actionName: "Add Sticker") { doc in
             let layer = Layer(
                 name: name,
-                kind: .sticker(spec),
+                kind: .sticker(resolvedSpec),
                 transform: LayerTransform(position: pos)
             )
             doc.add(layer)
-            if let resolvedBackground {
-                backgrounds[layer.id] = resolvedBackground
-            }
         }
     }
 
     public func stickerBackground(for layerID: UUID) -> RGBAColor? {
-        stickerBackgrounds[layerID]
+        guard let layer = document.layer(id: layerID),
+              case .sticker(let spec) = layer.kind else {
+            return nil
+        }
+        return spec.background
     }
 
     public func setStickerBackground(_ color: RGBAColor?, for layerID: UUID, continuous: Bool = false) {
         guard let idx = document.layers.firstIndex(where: { $0.id == layerID }),
-              !document.layers[idx].isLocked else { return }
+              !document.layers[idx].isLocked,
+              case .sticker(var spec) = document.layers[idx].kind else { return }
 
-        if let color {
-            lastSolidStickerBackgroundColor = color
-        }
+        spec.background = color
 
         if continuous {
             beginContinuousEdit()
-            if let color {
-                stickerBackgrounds[layerID] = color
-            } else {
-                stickerBackgrounds.removeValue(forKey: layerID)
-            }
+            document.layers[idx].kind = .sticker(spec)
             rerender()
         } else {
-            commitMutationWithState(actionName: "Change Sticker Background") { _, backgrounds in
-                if let color {
-                    backgrounds[layerID] = color
-                } else {
-                    backgrounds.removeValue(forKey: layerID)
-                }
+            commitMutation(actionName: "Change Sticker Background") { doc in
+                guard let i = doc.layers.firstIndex(where: { $0.id == layerID }),
+                      !doc.layers[i].isLocked,
+                      case .sticker(var targetSpec) = doc.layers[i].kind else { return }
+                targetSpec.background = color
+                doc.layers[i].kind = .sticker(targetSpec)
             }
+        }
+    }
+
+    /// Toggles sticker Solid Background ON/OFF using a high-contrast default color
+    /// (black for light sticker tints, white for dark tints) when enabled.
+    public func toggleStickerSolidBackground(enabled: Bool, for layerID: UUID?) {
+        let activeTint: RGBAColor
+        if let layerID,
+           let layer = document.layer(id: layerID),
+           case .sticker(let spec) = layer.kind {
+            activeTint = spec.tintColor
+        } else {
+            activeTint = defaultStickerTint
+        }
+
+        let newColor: RGBAColor? = enabled ? StickerDisplayName.contrastingBackground(for: activeTint) : nil
+        defaultStickerBackground = newColor
+        if let layerID {
+            setStickerBackground(newColor, for: layerID)
         }
     }
 
@@ -1228,10 +1170,8 @@ public final class EditorModel: Identifiable {
     }
 
     public func duplicateLayer(id: UUID) {
-        commitMutationWithState(actionName: "Duplicate Layer") { doc, backgrounds in
-            if let copy = doc.duplicate(id: id), let bg = backgrounds[id] {
-                backgrounds[copy.id] = bg
-            }
+        commitMutation(actionName: "Duplicate Layer") { doc in
+            doc.duplicate(id: id)
         }
     }
 
@@ -1241,9 +1181,8 @@ public final class EditorModel: Identifiable {
     }
 
     public func deleteLayer(id: UUID) {
-        commitMutationWithState(actionName: "Delete Layer") { doc, backgrounds in
+        commitMutation(actionName: "Delete Layer") { doc in
             doc.remove(id: id)
-            backgrounds.removeValue(forKey: id)
         }
     }
 
@@ -1581,10 +1520,7 @@ public final class EditorModel: Identifiable {
             }
             return CGSize(width: 120, height: 40)
         case .sticker(let spec):
-            return DocumentRenderer.stickerLogicalSize(
-                for: spec,
-                hasBackground: stickerBackgrounds[layer.id] != nil
-            )
+            return DocumentRenderer.stickerLogicalSize(for: spec)
         case .drawing(let spec):
             let allPts = spec.strokes.flatMap(\.points)
             guard let first = allPts.first else { return document.canvasSize }

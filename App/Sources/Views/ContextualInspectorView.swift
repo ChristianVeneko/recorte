@@ -1221,8 +1221,8 @@ struct ContextualInspectorView: View {
         }()
 
         let activeStickerBackground: RGBAColor? = {
-            if let (layerID, _) = editingSticker {
-                return model.stickerBackground(for: layerID)
+            if let (_, spec) = editingSticker {
+                return spec.background
             }
             return model.defaultStickerBackground
         }()
@@ -1260,17 +1260,13 @@ struct ContextualInspectorView: View {
                 onEnd: { model.endContinuousEdit(actionName: "Resize Sticker") }
             )
 
-            // S21: Solid background badge for stickers (applies live to selected sticker and default for new stickers)
+            // S21: Solid background badge for stickers (contrasting default color; stored on StickerSpec)
             Toggle(
                 "Solid Background",
                 isOn: Binding(
                     get: { activeStickerBackground != nil },
                     set: { enabled in
-                        let newColor: RGBAColor? = enabled ? model.lastSolidStickerBackgroundColor : nil
-                        model.defaultStickerBackground = newColor
-                        if let (layerID, _) = editingSticker {
-                            model.setStickerBackground(newColor, for: layerID)
-                        }
+                        model.toggleStickerSolidBackground(enabled: enabled, for: editingSticker?.0)
                     }
                 )
             )
@@ -1282,7 +1278,6 @@ struct ContextualInspectorView: View {
                         get: { bgColor.swiftUIColor },
                         set: { newColor in
                             let rgba = RGBAColor(swiftUIColor: newColor)
-                            model.lastSolidStickerBackgroundColor = rgba
                             model.defaultStickerBackground = rgba
                             if let (layerID, _) = editingSticker {
                                 model.setStickerBackground(rgba, for: layerID)
