@@ -1,0 +1,204 @@
+<title>Recorte Layouts</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<style>
+/* Layout: a column of large window mockups, each with its case beside it; Apple-native world, only the structure varies. */
+:root{
+  --bg:#eef0f3; --fg:#1d1f23; --muted:#5d636d; --line:#d6dae0; --card:#ffffff;
+  --accent:#0a6cff; --win:#f6f7f9; --side:#eceef2; --canvas:#d9dce2; --ink:#2a2e35;
+  --glass:rgba(255,255,255,.55); --glass-edge:rgba(255,255,255,.85); --shadow:0 18px 40px rgba(20,30,50,.18);
+  --sans:-apple-system,"SF Pro Text",BlinkMacSystemFont,"Helvetica Neue",Arial,sans-serif;
+  --display:-apple-system,"SF Pro Display",BlinkMacSystemFont,"Helvetica Neue",Arial,sans-serif;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#15171b; --fg:#eceef1; --muted:#9aa1ab; --line:#2c3037; --card:#1d2026;
+  --accent:#3d8bff; --win:#23262c; --side:#1c1f24; --canvas:#101215; --ink:#e6e8eb;
+  --glass:rgba(60,64,72,.5); --glass-edge:rgba(255,255,255,.18); --shadow:0 18px 40px rgba(0,0,0,.5); color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#15171b; --fg:#eceef1; --muted:#9aa1ab; --line:#2c3037; --card:#1d2026;
+  --accent:#3d8bff; --win:#23262c; --side:#1c1f24; --canvas:#101215; --ink:#e6e8eb;
+  --glass:rgba(60,64,72,.5); --glass-edge:rgba(255,255,255,.18); --shadow:0 18px 40px rgba(0,0,0,.5); color-scheme:dark}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--fg);font:15px/1.5 var(--sans);padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));padding-block:40px 64px}
+.wrap{max-width:1180px;margin:0 auto;display:grid;gap:48px}
+header h1{font:700 clamp(28px,4vw,40px)/1.1 var(--display);letter-spacing:-.02em;margin:0 0 8px;text-wrap:balance}
+header p{margin:0;color:var(--muted);max-width:62ch}
+.opt{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(0,1fr);gap:28px;align-items:start}
+@media (max-width:860px){.opt{grid-template-columns:1fr}}
+.case{display:grid;gap:12px;min-width:0}
+.kicker{font:600 12px/1 var(--sans);letter-spacing:.08em;text-transform:uppercase;color:var(--accent)}
+.case h2{font:700 24px/1.15 var(--display);margin:0;letter-spacing:-.01em}
+.case p{margin:0;color:var(--muted)}
+.case dl{margin:0;display:grid;gap:8px}
+.case dt{font-weight:600;font-size:13px}
+.case dd{margin:0;color:var(--muted);font-size:14px}
+.pick{justify-self:start;font:600 14px var(--sans);border:1px solid var(--line);background:var(--card);color:var(--fg);padding:8px 14px;border-radius:999px}
+.canon{opacity:.85}
+.canon .win{transform:scale(.97)}
+
+/* window */
+.stage{background:linear-gradient(135deg,#7aa7d9,#c8a6d8 55%,#f0c9a6);border-radius:18px;padding:clamp(12px,3vw,28px);min-width:0}
+.win{background:var(--win);border-radius:14px;box-shadow:var(--shadow);overflow:hidden;aspect-ratio:16/10.5;display:grid;grid-template-rows:auto 1fr;position:relative;font-size:11px;color:var(--ink);max-width:100%}
+.bar{display:flex;align-items:center;gap:10px;padding:8px 10px;position:relative;z-index:3}
+.lights{display:flex;gap:6px}.lights i{width:11px;height:11px;border-radius:50%;background:#ff5f57}.lights i:nth-child(2){background:#febc2e}.lights i:nth-child(3){background:#28c840}
+.tabs{display:flex;gap:4px;flex:1;min-width:0}
+.tab{padding:4px 10px;border-radius:7px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tab.on{background:var(--glass);color:var(--ink);box-shadow:inset 0 0 0 1px var(--glass-edge)}
+.glass{background:var(--glass);backdrop-filter:blur(18px) saturate(1.6);-webkit-backdrop-filter:blur(18px) saturate(1.6);box-shadow:inset 0 0 0 1px var(--glass-edge),0 6px 18px rgba(0,0,0,.12);border-radius:999px}
+.tools{display:flex;gap:2px;padding:3px}
+.tools b{width:24px;height:22px;display:grid;place-items:center;border-radius:999px;font-weight:500}
+.tools b.on{background:var(--accent);color:#fff}
+.body{display:grid;min-height:0;position:relative}
+.canvas{background:var(--canvas);position:relative;display:grid;place-items:center;min-height:0;overflow:hidden}
+.panel{background:var(--side);padding:8px;display:grid;align-content:start;gap:6px;min-width:0}
+.panel h5{margin:2px 0 2px;font-size:9.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+.row{display:flex;align-items:center;gap:6px;padding:4px 5px;border-radius:6px;white-space:nowrap;overflow:hidden}
+.row.on{background:var(--accent);color:#fff}
+.thumb{width:22px;height:16px;border-radius:3px;background:#3a4150;flex:none}
+.slider{height:4px;border-radius:2px;background:var(--line);position:relative}.slider::after{content:"";position:absolute;left:0;top:0;bottom:0;width:60%;background:var(--accent);border-radius:2px}
+
+/* sample screenshot */
+.shot{width:62%;aspect-ratio:16/10;background:#1e2230;border-radius:4px;position:relative;box-shadow:0 4px 14px rgba(0,0,0,.25);padding:6% 7%;display:grid;gap:5%;align-content:start}
+.shot i{display:block;height:7%;min-height:4px;border-radius:2px;background:#5b6b8c}
+.shot i:nth-child(2){width:70%;background:#c678dd}.shot i:nth-child(3){width:85%;background:#61afef}.shot i:nth-child(4){width:50%;background:#98c379}.shot i:nth-child(5){width:65%;background:#e5c07b}
+.sticker{position:absolute;right:-6%;top:-10%;font-size:22px}
+.label{position:absolute;left:8%;bottom:-9%;background:#ffd60a;color:#1d1f23;font-weight:700;padding:2px 6px;border-radius:4px;font-size:10px}
+.crop{position:absolute;inset:18% 22% 22% 16%;border:1.5px solid #fff;box-shadow:0 0 0 999px rgba(0,0,0,.42)}
+.crop::before,.crop::after{content:"";position:absolute;inset:0;background:linear-gradient(90deg,transparent 33%,rgba(255,255,255,.5) 33.3%,transparent 33.6%,transparent 66.3%,rgba(255,255,255,.5) 66.6%,transparent 67%)}
+.crop::after{background:linear-gradient(0deg,transparent 33%,rgba(255,255,255,.5) 33.3%,transparent 33.6%,transparent 66.3%,rgba(255,255,255,.5) 66.6%,transparent 67%)}
+.h{position:absolute;width:10px;height:10px;border:3px solid #fff;z-index:2}
+.h.a{left:-3px;top:-3px;border-right:0;border-bottom:0}.h.b{right:-3px;top:-3px;border-left:0;border-bottom:0}.h.c{left:-3px;bottom:-3px;border-right:0;border-top:0}.h.d{right:-3px;bottom:-3px;border-left:0;border-top:0}
+.chips{position:absolute;left:50%;transform:translateX(-50%);display:flex;gap:4px;padding:3px}
+.chips span{padding:3px 8px;border-radius:999px;white-space:nowrap}.chips span.on{background:var(--accent);color:#fff}
+
+/* A: tray */
+.A .body{grid-template-columns:1fr 26%}
+.A .dock{position:absolute;left:10px;top:50%;transform:translateY(-50%);flex-direction:column;border-radius:16px;z-index:2}
+.A .tray{position:absolute;left:10px;right:calc(26% + 10px);bottom:10px;border-radius:14px;display:flex;gap:8px;padding:6px 8px;align-items:center;z-index:2}
+.A .tray .t{width:50px;aspect-ratio:16/10;border-radius:5px;background:#2f3546;flex:none;position:relative}
+.A .tray .t.on{outline:2px solid var(--accent);outline-offset:1px}
+.A .tray .t:nth-child(2){background:#7a4b3a}.A .tray .t:nth-child(3){background:#3d6a52}
+.A .tray .drag{position:absolute;left:46%;bottom:22%;width:44px;height:30px;border-radius:5px;background:#7a4b3a;box-shadow:0 8px 20px rgba(0,0,0,.35);transform:rotate(-6deg);border:2px dashed #fff}
+.A .tray em{font-style:normal;color:var(--muted);margin-left:auto;white-space:nowrap}
+/* B: side by side */
+.B .body{grid-template-columns:20% 1fr 1fr}
+.B .canvas+.canvas{border-left:1px solid var(--line)}
+.B .ctag{position:absolute;top:8px;left:8px;padding:3px 9px;font-weight:600;border-radius:999px}
+.B .piece{position:absolute;left:-14%;top:42%;width:34%;aspect-ratio:16/10;background:#1e2230;border:2px dashed var(--accent);border-radius:4px;box-shadow:0 10px 24px rgba(0,0,0,.35)}
+.B .arrow{position:absolute;left:-6%;top:36%;font-size:20px;color:var(--accent);font-weight:700}
+.B .photo{width:70%;aspect-ratio:4/3;border-radius:4px;background:linear-gradient(160deg,#f7c58f,#d9785a 60%,#6d3b3b)}
+.B .float{position:absolute;bottom:10px;left:calc(20% + 10px);right:10px;display:flex;justify-content:center}
+/* C: crop always live */
+.C .body{grid-template-rows:1fr auto}
+.C .strip{background:var(--side);display:flex;gap:6px;padding:6px 8px;align-items:center;overflow:hidden;border-top:1px solid var(--line)}
+.C .layer{display:flex;align-items:center;gap:5px;padding:3px 8px 3px 4px;border-radius:8px;background:var(--card);white-space:nowrap}
+.C .layer.on{box-shadow:0 0 0 1.5px var(--accent)}
+.C .pop{position:absolute;right:12px;top:12px;border-radius:14px;padding:8px;width:28%;display:grid;gap:6px;z-index:2}
+.C .ratio{display:grid;grid-template-columns:repeat(3,1fr);gap:4px}
+.C .ratio span{text-align:center;padding:3px 0;border-radius:6px;background:rgba(127,127,127,.15)}
+.C .ratio span.on{background:var(--accent);color:#fff}
+.C .shapes{display:flex;gap:6px;font-size:13px}
+/* D: canon */
+.D .body{grid-template-columns:22% 1fr 26%}
+.D .bar .tools{margin-left:auto}
+</style>
+
+<div class="wrap">
+<header>
+  <h1>Recorte: elige la estructura</h1>
+  <p>El estilo ya está decidido (estándar de Apple, Liquid Glass en la barra y en las paletas flotantes). Las opciones cambian cómo se organiza la pantalla. Todas tienen recorte, capas, pestañas, texto, stickers, figuras y filtros. Responde con la letra que prefieras.</p>
+</header>
+
+<!-- A -->
+<section class="opt">
+  <div class="stage"><div class="win A">
+    <div class="bar"><div class="lights"><i></i><i></i><i></i></div>
+      <div class="tabs"><span class="tab on">Screenshot 11.42</span><span class="tab">sunset.heic</span><span class="tab">Logo</span></div>
+      <div class="glass tools"><b>⇧</b><b>⤴︎</b></div></div>
+    <div class="body">
+      <div class="canvas">
+        <div class="glass tools dock"><b>➚</b><b class="on">⌗</b><b>T</b><b>◯</b><b>☺︎</b><b>✦</b></div>
+        <div class="shot"><i></i><i></i><i></i><i></i><i></i><span class="sticker">🔥</span><span class="label">BUG AQUÍ</span>
+          <div class="crop"><span class="h a"></span><span class="h b"></span><span class="h c"></span><span class="h d"></span></div></div>
+        <div class="glass tray"><span class="t on"></span><span class="t"></span><span class="t"></span><span class="drag"></span><em>Arrastra una pieza a la imagen</em></div>
+      </div>
+      <div class="panel"><h5>Capas</h5>
+        <div class="row on"><span class="thumb"></span>Recorte</div><div class="row"><span class="thumb" style="background:#ffd60a"></span>Texto</div><div class="row"><span class="thumb" style="background:#f7a35c"></span>Sticker</div><div class="row"><span class="thumb"></span>Fondo</div>
+        <h5>Ajustes</h5><div class="slider"></div><div class="slider" style="opacity:.7"></div></div>
+    </div></div></div>
+  <div class="case">
+    <span class="kicker">Propuesta 1</span>
+    <h2>A · Bandeja</h2>
+    <p>Las imágenes abiertas viven también en una bandeja de cristal abajo. Recortas en una y arrastras la pieza desde la bandeja a la imagen principal como capa nueva.</p>
+    <dl><dt>Brilla en</dt><dd>Mover recortes entre imágenes: es un solo gesto, sin cambiar de pestaña.</dd>
+    <dt>Costo</dt><dd>La bandeja ocupa una franja del lienzo; se oculta con un atajo.</dd></dl>
+  </div>
+</section>
+
+<!-- B -->
+<section class="opt">
+  <div class="stage"><div class="win B">
+    <div class="bar"><div class="lights"><i></i><i></i><i></i></div>
+      <div class="tabs"><span class="tab on">Screenshot 11.42  ⇄  sunset.heic</span><span class="tab">Logo</span></div>
+      <div class="glass tools"><b>➚</b><b class="on">⌗</b><b>T</b><b>◯</b><b>☺︎</b><b>✦</b></div></div>
+    <div class="body">
+      <div class="panel"><h5>Capas · sunset</h5>
+        <div class="row on"><span class="thumb"></span>Pieza pegada</div><div class="row"><span class="thumb" style="background:#d9785a"></span>Foto</div>
+        <h5>Abiertas</h5><div class="row"><span class="thumb"></span>Screenshot</div><div class="row"><span class="thumb" style="background:#d9785a"></span>sunset</div><div class="row"><span class="thumb" style="background:#3d6a52"></span>Logo</div></div>
+      <div class="canvas"><span class="glass ctag">Origen</span>
+        <div class="shot"><i></i><i></i><i></i><i></i><i></i><div class="crop"><span class="h a"></span><span class="h b"></span><span class="h c"></span><span class="h d"></span></div></div></div>
+      <div class="canvas"><span class="glass ctag">Destino</span><div class="photo"></div><span class="arrow">→</span><div class="piece"></div></div>
+      <div class="float"><div class="glass chips"><span class="on">Libre</span><span>1:1</span><span>16:9</span><span>◯</span><span>♡</span></div></div>
+    </div></div></div>
+  <div class="case">
+    <span class="kicker">Propuesta 2</span>
+    <h2>B · Lado a lado</h2>
+    <p>Dos pestañas se abren juntas en pantalla dividida: origen y destino. Recortas a la izquierda y sueltas a la derecha.</p>
+    <dl><dt>Brilla en</dt><dd>Componer con varias capturas viendo las dos a la vez.</dd>
+    <dt>Costo</dt><dd>Cada imagen tiene la mitad de espacio; para editar una sola vuelves a vista simple.</dd></dl>
+  </div>
+</section>
+
+<!-- C -->
+<section class="opt">
+  <div class="stage"><div class="win C">
+    <div class="bar"><div class="lights"><i></i><i></i><i></i></div>
+      <div class="tabs"><span class="tab on">Screenshot 11.42</span><span class="tab">sunset.heic</span><span class="tab">Logo</span></div>
+      <div class="glass tools"><b>➚</b><b class="on">⌗</b><b>T</b><b>◯</b><b>☺︎</b><b>✦</b><b>⇧</b></div></div>
+    <div class="body">
+      <div class="canvas">
+        <div class="shot" style="width:68%"><i></i><i></i><i></i><i></i><i></i><span class="sticker">🔥</span>
+          <div class="crop"><span class="h a"></span><span class="h b"></span><span class="h c"></span><span class="h d"></span></div></div>
+        <div class="glass pop"><h5 style="margin:0;font-size:9.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em">Recorte</h5>
+          <div class="ratio"><span class="on">Libre</span><span>Original</span><span>1:1</span><span>4:3</span><span>16:9</span><span>9:16</span></div>
+          <div class="shapes"><span>▢</span><span>▢̊</span><span>◯</span><span>☆</span><span>♡</span></div>
+          <div class="slider"></div></div>
+      </div>
+      <div class="strip"><span class="layer on"><span class="thumb"></span>Captura</span><span class="layer"><span class="thumb" style="background:#f7a35c"></span>🔥</span><span class="layer"><span class="thumb" style="background:#ffd60a"></span>Texto</span><span style="margin-left:auto;color:var(--muted);white-space:nowrap">⌘V pega como capa</span></div>
+    </div></div></div>
+  <div class="case">
+    <span class="kicker">Propuesta 3</span>
+    <h2>C · Recorte siempre listo</h2>
+    <p>Al pegar una captura ya aparecen las asas de recorte. El lienzo ocupa casi toda la ventana; las capas son una tira abajo y las opciones flotan en cristal.</p>
+    <dl><dt>Brilla en</dt><dd>Pegar, recortar y compartir en segundos. Es lo más fiel a "lo que me importa es recortar".</dd>
+    <dt>Costo</dt><dd>Para mover piezas entre imágenes usas copiar/pegar o arrastrar a la pestaña.</dd></dl>
+  </div>
+</section>
+
+<!-- D canon -->
+<section class="opt canon">
+  <div class="stage"><div class="win D">
+    <div class="bar"><div class="lights"><i></i><i></i><i></i></div>
+      <div class="tabs"><span class="tab on">Screenshot 11.42</span><span class="tab">sunset.heic</span></div>
+      <div class="glass tools"><b>➚</b><b class="on">⌗</b><b>T</b><b>◯</b><b>☺︎</b><b>✦</b></div></div>
+    <div class="body">
+      <div class="panel"><h5>Capas</h5><div class="row on"><span class="thumb"></span>Captura</div><div class="row"><span class="thumb" style="background:#ffd60a"></span>Texto</div><div class="row"><span class="thumb" style="background:#f7a35c"></span>Sticker</div></div>
+      <div class="canvas"><div class="shot" style="width:78%"><i></i><i></i><i></i><i></i><i></i><div class="crop"><span class="h a"></span><span class="h b"></span><span class="h c"></span><span class="h d"></span></div></div></div>
+      <div class="panel"><h5>Recorte</h5><div class="row on">Libre</div><div class="row">1:1</div><div class="row">16:9</div><h5>Ajustes</h5><div class="slider"></div><div class="slider"></div></div>
+    </div></div></div>
+  <div class="case">
+    <span class="kicker">Opción clásica</span>
+    <h2>D · Estándar de Mac</h2>
+    <p>Capas a la izquierda, lienzo al centro, inspector a la derecha, como Vista Previa o Pixelmator. Lo conocido, bien hecho.</p>
+  </div>
+</section>
+</div>
