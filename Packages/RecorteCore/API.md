@@ -1,15 +1,35 @@
 # RecorteCore API Summary
 
+- Coordinates: top-left origin, y down, in canvas points (`layer.transform.position` is the layer center, matching SwiftUI `.position`; `DrawingStroke.points` are in layer-local top-left coordinates, equal to canvas points when `position == .zero`).
 - `EditorDocument`: Value type `{canvasSize, background: .transparent|.solid(RGBAColor), layers: [Layer], selection: UUID?}`.
 - `EditorDocument` mutating ops: `add(_:)`, `remove(id:)`, `duplicate(id:)`, `reorder(from:to:)`, `move(id:to:)`, `setVisibility(id:isHidden:)`, `setLock(id:isLocked:)`, `setOpacity(id:opacity:)`.
 - `Layer`: `{id: UUID, name, kind: LayerKind, transform: LayerTransform(position, scale, rotation/rotationDegrees), opacity, isHidden, isLocked}`.
-- `LayerKind`: `.image(SendableImage)` | `.text(TextSpec)` | `.shape(ShapeSpec)` | `.sticker(StickerSpec)`.
-- `SendableImage`: `@unchecked Sendable` wrapper around immutable `CGImage` + `filterPreset: FilterPreset` + `adjustments: Adjustments`.
-- `TextSpec`: `{string, fontName, size, color, alignment: .left|.center|.right, stroke: TextStrokeSpec?, background: RGBAColor?}`.
-- `ShapeSpec`: `{kind: .rect|.roundedRect(cornerRadius)|.ellipse|.line|.arrow, size, strokeColor, fillColor, lineWidth}`.
+- `LayerKind`: `.image(SendableImage)` | `.text(TextSpec)` | `.shape(ShapeSpec)` | `.sticker(StickerSpec)` | `.drawing(DrawingSpec)`.
+- `SendableImage`: `@unchecked Sendable` wrapper around immutable `CGImage` + `filterPreset: FilterPreset` + `adjustments: Adjustments` + `frame: ImageFrame` (default `.none`).
+- `ImageFrame`: `.none` | `.border(width:color:)` | `.roundedCorners(radius:)` | `.polaroid(caption:borderColor:)` | `.dropShadow(radius:offsetX:offsetY:color:)`.
+- `TextSpec`: `{string, fontName, size, color, alignment: .left|.center|.right, stroke: TextStrokeSpec?, background: RGBAColor?, gradient: TextGradientSpec?, bubble: TextBubbleStyle, bubbleColor: RGBAColor?, bubbleStrokeColor: RGBAColor?, bubbleStrokeWidth: Double}`.
+  - `TextGradientSpec`: `{colors: [RGBAColor], angleDegrees: Double}` (0° = left-to-right, 90° = top-to-bottom).
+  - `TextBubbleStyle`: `.none | .rounded | .speech | .thought | .shout`.
+- `ShapeSpec`: `{kind: .rect|.roundedRect(cornerRadius)|.ellipse|.line|.arrow|.triangle|.star, size, strokeColor, fillColor, lineWidth}`.
 - `StickerSpec`: `{content: .emoji(String)|.sfSymbol(String), pointSize, tintColor}` (helpers: `.emoji(_:pointSize:)`, `.sfSymbol(_:pointSize:tintColor:)`).
+- `DrawingSpec`: `{strokes: [DrawingStroke]}` where `DrawingStroke` has `{points: [CGPoint], color: RGBAColor, width: Double, tool: DrawingToolKind (.brush | .marker | .highlighter)}`.
 - `CropSpec`: `{rect, aspect: .free|.original|.ratio1x1|.ratio4x3|.ratio3x4|.ratio16x9|.ratio9x16, shape: .rectangle|.roundedRect(radius)|.ellipse|.star|.heart, rotationDegrees, flipH, flipV}`.
 - `Cropper`: `constrainRect(_:aspect:in:) -> CGRect`, `maskPath(for:in:) -> CGPath`, `crop(_:spec:) throws -> CGImage` (and `crop(_:_:)`) with transparent pixels outside non-rectangular shapes.
 - `FilterPreset` & `Adjustments`: Presets (`none, mono, noir, chrome, fade, instant, process, transfer, vivid, warm, cool`) & `{brightness, contrast, saturation, exposure, warmth, sharpness, vignette}` via `ImageFilters.apply(to:preset:adjustments:)` using `ImageFilters.sharedContext`.
-- `Renderer`: `Renderer.render(_:scale:) throws -> CGImage` (and `render(_:_:)`) compositing visible layers with transforms/opacity via CoreGraphics + CoreText.
+- `ImageTools` (pure functions on `CGImage`, top-left coordinates):
+  - `lassoCutout(_:path:cropToPathBounds:) throws -> CGImage`
+  - `cloneStamp(_:from:to:radius:softness:opacity:) throws -> CGImage`
+  - `perspectiveCorrect(_:quad:)` / `perspectiveCorrect(_:topLeft:topRight:bottomRight:bottomLeft:) throws -> CGImage` (`PerspectiveQuad`, `CIPerspectiveCorrection`)
+  - `deform(_:preset:center:radius:strength:) throws -> CGImage` (`DeformPreset`: `.bump | .pinch | .twirl`)
+  - `applyCurves(_:curve:)` / `applyCurves(_:points:) throws -> CGImage` (`ToneCurveSpec`, 5-point `CIToneCurve`)
+  - `resize(_:to:keepAspect:) throws -> CGImage` (`CILanczosScaleTransform`)
+  - `rotate90(_:direction:) throws -> CGImage` (`RotationDirection`: `.left90 | .right90`)
+  - `flip(_:axis:) throws -> CGImage` (`FlipAxis`: `.horizontal | .vertical`)
+- `RecorteProject` & `RecorteProjectManifest` (Codable `.recorte` package format + PDF export):
+  - `RecorteProject.save(_:to:) throws`, `RecorteProject.load(from:) throws -> EditorDocument`, `RecorteProject.loadProject(from:) throws -> RecorteProject` (writes `document.json` + lossless PNG per image layer under `assets/`).
+  - `RecorteProject.exportPDFData(_:scale:) throws -> Data`, `RecorteProject.exportPDF(_:to:scale:) throws`.
+- `CollageLayout` & `CollageBuilder`:
+  - `CollageLayout`: `.freeStyle`, `.twoHorizontal`, `.twoVertical`, `.threeGrid`, `.threeMosaicLeft`, `.threeMosaicTop`, `.fourGrid`, `.fourMosaic`, `.fiveMosaic`, `.sixGrid`, `.sixMosaic` (`cellCount`, `normalizedCells`, `cellRects(in:spacing:)`, `makeDocument(...)`).
+  - `CollageBuilder.makeDocument(layout:images:canvasSize:background:spacing:cornerRadius:) throws -> EditorDocument` & `aspectFill(_:into:) throws -> CGImage`.
+- `Renderer`: `Renderer.render(_:scale:) throws -> CGImage` (and `render(_:_:)`) compositing visible layers with transforms/opacity via CoreGraphics + CoreText in top-left canvas coordinates.
 - `UndoStack<State>`: Generic value stack `{current, canUndo, canRedo, push(_:), undo() -> State?, redo() -> State?}`.
