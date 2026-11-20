@@ -48,7 +48,7 @@ struct EraserOverlayView: View {
                         }
                         .onEnded { _ in
                             if isDragging {
-                                model.endEraserStroke()
+                                model.endEraserStrokeInBackground()
                                 isDragging = false
                             }
                         }
@@ -113,7 +113,7 @@ struct EraserOverlayView: View {
         }
         .onDisappear {
             if isDragging {
-                model.endEraserStroke()
+                model.endEraserStrokeInBackground()
                 isDragging = false
             }
             updateCrosshairCursor(active: false)
@@ -332,7 +332,7 @@ struct EraserShortcutBridge: NSViewRepresentable {
             guard modifiers.isEmpty else { return event }
 
             if event.keyCode == 53, model.activeTool == .eraser {
-                model.endEraserStroke()
+                model.endEraserStrokeInBackground()
                 model.activeTool = .move
                 return nil
             }

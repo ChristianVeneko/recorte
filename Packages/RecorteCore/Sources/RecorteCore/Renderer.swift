@@ -24,114 +24,134 @@ public enum Renderer {
     ///
     /// Coordinates: top-left origin, y down, in canvas points (`layer.transform.position` is the layer center).
     public static func render(_ document: EditorDocument, scale: CGFloat = 1.0) throws -> CGImage {
-        let effectiveScale = max(scale, 0.01)
-        let pixelW = Int((document.canvasSize.width * effectiveScale).rounded())
-        let pixelH = Int((document.canvasSize.height * effectiveScale).rounded())
-        guard pixelW > 0, pixelH > 0 else {
-            throw RenderError.invalidCanvasSize
-        }
-
-        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
-        let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
-
-        guard let ctx = CGContext(
-            data: nil,
-            width: pixelW,
-            height: pixelH,
-            bitsPerComponent: 8,
-            bytesPerRow: pixelW * 4,
-            space: colorSpace,
-            bitmapInfo: bitmapInfo
-        ) else {
-            throw RenderError.contextCreationFailed
-        }
-
-        let fullRect = CGRect(x: 0, y: 0, width: CGFloat(pixelW), height: CGFloat(pixelH))
-        ctx.clear(fullRect)
-
-        // Work in logical canvas coordinates (top-left origin, y down, in canvas points)
-        ctx.saveGState()
-        ctx.scaleBy(x: effectiveScale, y: effectiveScale)
-        ctx.translateBy(x: 0, y: document.canvasSize.height)
-        ctx.scaleBy(x: 1.0, y: -1.0)
-
-        let canvasRect = CGRect(origin: .zero, size: document.canvasSize)
-
-        // 1. Draw Background
-        switch document.background {
-        case .transparent:
-            break
-        case .solid(let color):
-            ctx.setFillColor(color.cgColor)
-            ctx.fill(canvasRect)
-        }
-
-        // 2. Draw visible layers in stack order (bottom to top)
-        for layer in document.layers where !layer.isHidden && layer.opacity > 0.0 {
-            ctx.saveGState()
-            ctx.setAlpha(CGFloat(layer.opacity))
-
-            // Apply layer transform around layer.transform.position
-            ctx.translateBy(x: layer.transform.position.x, y: layer.transform.position.y)
-            if layer.transform.rotationDegrees != 0 {
-                let rad = CGFloat(layer.transform.rotationDegrees) * .pi / 180.0
-                ctx.rotate(by: rad)
+        try autoreleasepool {
+            let effectiveScale = max(scale, 0.01)
+            let pixelW = Int((document.canvasSize.width * effectiveScale).rounded())
+            let pixelH = Int((document.canvasSize.height * effectiveScale).rounded())
+            guard pixelW > 0, pixelH > 0 else {
+                throw RenderError.invalidCanvasSize
             }
-            ctx.scaleBy(x: layer.transform.scale.width, y: layer.transform.scale.height)
 
-            switch layer.kind {
-            case .image(let sendableImg):
-                drawImageLayer(sendableImg, in: ctx, renderScale: effectiveScale)
-            case .shape(let shapeSpec):
-                drawShapeLayer(shapeSpec, in: ctx)
-            case .text(let textSpec):
-                drawTextLayer(textSpec, in: ctx)
-            case .sticker(let stickerSpec):
-                drawStickerLayer(stickerSpec, in: ctx)
-            case .drawing(let drawingSpec):
-                drawDrawingLayer(drawingSpec, in: ctx)
+            let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+            let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
+
+            guard let ctx = CGContext(
+                data: nil,
+                width: pixelW,
+                height: pixelH,
+                bitsPerComponent: 8,
+                bytesPerRow: pixelW * 4,
+                space: colorSpace,
+                bitmapInfo: bitmapInfo
+            ) else {
+                throw RenderError.contextCreationFailed
+            }
+
+            let fullRect = CGRect(x: 0, y: 0, width: CGFloat(pixelW), height: CGFloat(pixelH))
+            ctx.clear(fullRect)
+
+            // Work in logical canvas coordinates (top-left origin, y down, in canvas points)
+            ctx.saveGState()
+            ctx.scaleBy(x: effectiveScale, y: effectiveScale)
+            ctx.translateBy(x: 0, y: document.canvasSize.height)
+            ctx.scaleBy(x: 1.0, y: -1.0)
+
+            let canvasRect = CGRect(origin: .zero, size: document.canvasSize)
+
+            // 1. Draw Background
+            switch document.background {
+            case .transparent:
+                break
+            case .solid(let color):
+                ctx.setFillColor(color.cgColor)
+                ctx.fill(canvasRect)
+            }
+
+            // 2. Draw visible layers in stack order (bottom to top)
+            for layer in document.layers where !layer.isHidden && layer.opacity > 0.0 {
+                ctx.saveGState()
+                ctx.setAlpha(CGFloat(layer.opacity))
+
+                // Apply layer transform around layer.transform.position
+                ctx.translateBy(x: layer.transform.position.x, y: layer.transform.position.y)
+                if layer.transform.rotationDegrees != 0 {
+                    let rad = CGFloat(layer.transform.rotationDegrees) * .pi / 180.0
+                    ctx.rotate(by: rad)
+                }
+                ctx.scaleBy(x: layer.transform.scale.width, y: layer.transform.scale.height)
+
+                switch layer.kind {
+                case .image(let sendableImg):
+                    let layerMaxScale = max(abs(layer.transform.scale.width), abs(layer.transform.scale.height))
+                    drawImageLayer(
+                        sendableImg,
+                        in: ctx,
+                        renderScale: effectiveScale,
+                        effectivePixelScale: effectiveScale * layerMaxScale
+                    )
+                case .shape(let shapeSpec):
+                    drawShapeLayer(shapeSpec, in: ctx)
+                case .text(let textSpec):
+                    drawTextLayer(textSpec, in: ctx)
+                case .sticker(let stickerSpec):
+                    drawStickerLayer(stickerSpec, in: ctx)
+                case .drawing(let drawingSpec):
+                    drawDrawingLayer(drawingSpec, in: ctx)
+                }
+
+                ctx.restoreGState()
             }
 
             ctx.restoreGState()
-        }
 
-        ctx.restoreGState()
-
-        guard let output = ctx.makeImage() else {
-            throw RenderError.imageCreationFailed
+            guard let output = ctx.makeImage() else {
+                throw RenderError.imageCreationFailed
+            }
+            return output
         }
-        return output
     }
 
     // MARK: - Image Layer
 
-    private static func drawImageLayer(_ sendableImg: SendableImage, in ctx: CGContext, renderScale: CGFloat) {
+    private static func drawImageLayer(
+        _ sendableImg: SendableImage,
+        in ctx: CGContext,
+        renderScale: CGFloat,
+        effectivePixelScale: CGFloat
+    ) {
+        let needsFilter = sendableImg.filterPreset != .none || !sendableImg.adjustments.isIdentity
         let filteredImage: CGImage
-        if sendableImg.filterPreset != .none || !sendableImg.adjustments.isIdentity {
+        if needsFilter {
+            // When rendering downscaled previews/thumbnails, downsample before running CoreImage
+            // so filters/adjustments don't allocate full-resolution CI intermediates unnecessarily.
+            let filterInput: CGImage
+            if effectivePixelScale < 0.95 {
+                let targetMax = max(64.0, ceil(CGFloat(max(sendableImg.width, sendableImg.height)) * effectivePixelScale))
+                filterInput = ImageFilters.downsample(sendableImg.cgImage, maxDimension: targetMax) ?? sendableImg.cgImage
+            } else {
+                filterInput = sendableImg.cgImage
+            }
             filteredImage = (try? ImageFilters.apply(
-                to: sendableImg.cgImage,
+                to: filterInput,
                 preset: sendableImg.filterPreset,
                 adjustments: sendableImg.adjustments
-            )) ?? sendableImg.cgImage
+            )) ?? filterInput
         } else {
             filteredImage = sendableImg.cgImage
         }
 
-        let imgToDraw: CGImage
-        if let mask = sendableImg.alphaMask {
-            imgToDraw = (try? ImageEraser.applyAlphaMask(mask, to: filteredImage)) ?? filteredImage
-        } else {
-            imgToDraw = filteredImage
-        }
-
-        let w = CGFloat(imgToDraw.width)
-        let h = CGFloat(imgToDraw.height)
+        let w = CGFloat(sendableImg.width)
+        let h = CGFloat(sendableImg.height)
         let localRect = CGRect(x: -w / 2.0, y: -h / 2.0, width: w, height: h)
 
-        func drawUprightImage() {
+        // Apply alpha mask directly via CGContext.clip(to:mask:) for zero intermediate full-res RGBA buffer copy.
+        func drawUprightImage(applyClipMask: Bool = true) {
             ctx.saveGState()
             ctx.scaleBy(x: 1.0, y: -1.0)
-            ctx.draw(imgToDraw, in: localRect)
+            if applyClipMask, let mask = sendableImg.alphaMask {
+                ctx.clip(to: localRect, mask: mask)
+            }
+            ctx.draw(filteredImage, in: localRect)
             ctx.restoreGState()
         }
 
@@ -207,7 +227,13 @@ public enum Renderer {
                 blur: max(0, CGFloat(radius)) * renderScale,
                 color: color.cgColor
             )
-            drawUprightImage()
+            if let mask = sendableImg.alphaMask,
+               let masked = try? ImageEraser.applyAlphaMask(mask, to: filteredImage) {
+                ctx.scaleBy(x: 1.0, y: -1.0)
+                ctx.draw(masked, in: localRect)
+            } else {
+                drawUprightImage(applyClipMask: false)
+            }
             ctx.restoreGState()
         }
     }

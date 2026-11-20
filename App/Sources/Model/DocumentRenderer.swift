@@ -100,11 +100,91 @@ public enum StickerDisplayName {
     }
 }
 
+// MARK: - Bounded Image & Filter Thumbnail Cache (S28 Memory)
+
+/// Bounded thumbnail cache ensuring inspector filter previews, layer sidebar thumbnails, and tray previews
+/// never upload full-resolution bitmaps to SwiftUI/CoreAnimation and compute each 160px downsample only once.
+@MainActor
+public enum ImageThumbnailCache {
+    public static let defaultMaxDimension: CGFloat = 160.0
+
+    private final class FilterThumbnailBundle {
+        let baseThumbnail: CGImage
+        let presets: [FilterPreset: CGImage]
+
+        init(baseThumbnail: CGImage, presets: [FilterPreset: CGImage]) {
+            self.baseThumbnail = baseThumbnail
+            self.presets = presets
+        }
+    }
+
+    private static let thumbnailCache: NSCache<NSString, CGImage> = {
+        let cache = NSCache<NSString, CGImage>()
+        cache.countLimit = 32
+        return cache
+    }()
+
+    private static let filterCache: NSCache<NSNumber, FilterThumbnailBundle> = {
+        let cache = NSCache<NSNumber, FilterThumbnailBundle>()
+        cache.countLimit = 4
+        return cache
+    }()
+
+    /// Returns a cached downsampled thumbnail (`<= maxDimension` px) computed once per `CGImage` identity.
+    public static func thumbnail(
+        for cgImage: CGImage,
+        maxDimension: CGFloat = defaultMaxDimension
+    ) -> CGImage {
+        let dim = max(16, Int(maxDimension.rounded()))
+        let key = "\(UInt(bitPattern: ObjectIdentifier(cgImage)))-\(dim)" as NSString
+        if let cached = thumbnailCache.object(forKey: key) {
+            return cached
+        }
+        let downsampled = ImageFilters.downsample(cgImage, maxDimension: CGFloat(dim)) ?? cgImage
+        thumbnailCache.setObject(downsampled, forKey: key)
+        return downsampled
+    }
+
+    /// Computes filter preset thumbnails once per source `CGImage` from a single 160 px downsample.
+    public static func filterThumbnails(
+        for cgImage: CGImage,
+        maxDimension: CGFloat = defaultMaxDimension
+    ) -> [FilterPreset: CGImage] {
+        let key = NSNumber(value: UInt(bitPattern: ObjectIdentifier(cgImage)))
+        if let cached = filterCache.object(forKey: key) {
+            return cached.presets
+        }
+
+        let base = thumbnail(for: cgImage, maxDimension: maxDimension)
+        var generated: [FilterPreset: CGImage] = [:]
+        generated.reserveCapacity(FilterPreset.allCases.count)
+        for preset in FilterPreset.allCases {
+            if preset == .none {
+                generated[preset] = base
+            } else if let filtered = try? ImageFilters.apply(to: base, preset: preset) {
+                generated[preset] = filtered
+            }
+        }
+        filterCache.setObject(FilterThumbnailBundle(baseThumbnail: base, presets: generated), forKey: key)
+        return generated
+    }
+
+    public static func clearCaches() {
+        thumbnailCache.removeAllObjects()
+        filterCache.removeAllObjects()
+    }
+}
+
 // MARK: - Live GPU Transform Split (S24 60fps)
 
 public struct LiveTransformSplit: Sendable {
     public let underlay: CGImage?
     public let activeLayerImage: CGImage
+    public let overlay: CGImage?
+}
+
+public struct LiveLayerSurroundingSplit: Sendable {
+    public let underlay: CGImage?
     public let overlay: CGImage?
 }
 
@@ -127,18 +207,18 @@ public enum DocumentRenderer {
         try Renderer.render(document, scale: scale)
     }
 
-    /// Renders a one-time split (underlay, active layer, overlay) so interactive transform gestures
-    /// can transform `activeLayerImage` on the GPU at 60–120fps without re-rendering per frame.
-    public static func renderLiveTransformSplit(
+    /// Renders only the layers below (`underlay`) and above (`overlay`) `activeLayerID` at `scale`.
+    /// Returns `nil` for either side if empty (and transparent for underlay) so single-layer docs allocate nothing.
+    public static func renderLayerSurroundingSplit(
         _ document: EditorDocument,
-        activeLayerID: UUID
-    ) -> LiveTransformSplit? {
+        activeLayerID: UUID,
+        scale: CGFloat = 1.0
+    ) -> LiveLayerSurroundingSplit? {
         guard let activeIndex = document.layers.firstIndex(where: { $0.id == activeLayerID }) else {
             return nil
         }
 
         let belowLayers = Array(document.layers[..<activeIndex])
-        let activeLayer = document.layers[activeIndex]
         let aboveLayers = activeIndex + 1 < document.layers.count
             ? Array(document.layers[(activeIndex + 1)...])
             : []
@@ -151,19 +231,9 @@ public enum DocumentRenderer {
                 layers: belowLayers,
                 selection: nil
             )
-            underlay = try? render(underlayDoc, scale: 1.0)
+            underlay = try? render(underlayDoc, scale: scale)
         } else {
             underlay = nil
-        }
-
-        let activeDoc = EditorDocument(
-            canvasSize: document.canvasSize,
-            background: .transparent,
-            layers: [activeLayer],
-            selection: nil
-        )
-        guard let activeImage = try? render(activeDoc, scale: 1.0) else {
-            return nil
         }
 
         let overlay: CGImage?
@@ -174,15 +244,41 @@ public enum DocumentRenderer {
                 layers: aboveLayers,
                 selection: nil
             )
-            overlay = try? render(overlayDoc, scale: 1.0)
+            overlay = try? render(overlayDoc, scale: scale)
         } else {
             overlay = nil
         }
 
+        return LiveLayerSurroundingSplit(underlay: underlay, overlay: overlay)
+    }
+
+    /// Renders a one-time split (underlay, active layer, overlay) at `scale` so interactive transform gestures
+    /// can transform `activeLayerImage` on the GPU at 60–120fps without re-rendering per frame.
+    public static func renderLiveTransformSplit(
+        _ document: EditorDocument,
+        activeLayerID: UUID,
+        scale: CGFloat = 1.0
+    ) -> LiveTransformSplit? {
+        guard let activeIndex = document.layers.firstIndex(where: { $0.id == activeLayerID }),
+              let surrounding = renderLayerSurroundingSplit(document, activeLayerID: activeLayerID, scale: scale) else {
+            return nil
+        }
+
+        let activeLayer = document.layers[activeIndex]
+        let activeDoc = EditorDocument(
+            canvasSize: document.canvasSize,
+            background: .transparent,
+            layers: [activeLayer],
+            selection: nil
+        )
+        guard let activeImage = try? render(activeDoc, scale: scale) else {
+            return nil
+        }
+
         return LiveTransformSplit(
-            underlay: underlay,
+            underlay: surrounding.underlay,
             activeLayerImage: activeImage,
-            overlay: overlay
+            overlay: surrounding.overlay
         )
     }
 }

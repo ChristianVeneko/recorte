@@ -278,4 +278,47 @@ struct EraserCoreTests {
             Issue.record("Expected image layer after project reload")
         }
     }
+
+    @Test("S27: 200 synthetic eraser drag points on a 2000x2000 persistent mask complete well under 0.5 s")
+    func persistentMask200DragPointsUnderHalfSecond() throws {
+        let width = 2000
+        let height = 2000
+        let persistent = try PersistentAlphaMask(baseMask: nil, width: width, height: height)
+
+        let points: [CGPoint] = (0..<200).map { i in
+            let t = CGFloat(i) / 199.0
+            let x = 200.0 + t * 1600.0
+            let y = 1000.0 + sin(t * .pi * 4.0) * 240.0
+            return CGPoint(x: x, y: y)
+        }
+
+        let start = CFAbsoluteTimeGetCurrent()
+        persistent.beginStroke(brushSize: 40, hardness: 0.5, mode: .erase)
+        var dirtyUpdates = 0
+        for pt in points {
+            if let dirty = persistent.appendPoint(pt) {
+                dirtyUpdates += 1
+                #expect(dirty.width < width && dirty.height < height)
+            }
+        }
+        _ = persistent.finishStroke()
+        let finalMask = try persistent.makeMaskImage()
+        let elapsed = CFAbsoluteTimeGetCurrent() - start
+
+        #expect(dirtyUpdates >= 150)
+        #expect(finalMask.width == width && finalMask.height == height)
+        #expect(elapsed < 0.5, "Expected 200 drag points on 2000x2000 mask in <0.5s, took \(elapsed)s")
+
+        // Also verify full-res bounding-box replay via ImageEraser.applyStrokeToMask completes fast
+        let replayStart = CFAbsoluteTimeGetCurrent()
+        let replayedMask = try ImageEraser.applyStrokeToMask(
+            nil,
+            width: width,
+            height: height,
+            stroke: EraserStroke(points: points, brushSize: 40, hardness: 0.5, mode: .erase)
+        )
+        let replayElapsed = CFAbsoluteTimeGetCurrent() - replayStart
+        #expect(replayedMask.width == width && replayedMask.height == height)
+        #expect(replayElapsed < 0.5, "Expected applyStrokeToMask replay on 2000x2000 in <0.5s, took \(replayElapsed)s")
+    }
 }

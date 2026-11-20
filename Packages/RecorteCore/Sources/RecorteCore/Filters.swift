@@ -67,14 +67,53 @@ public enum FilterError: Error, Sendable, Equatable {
 
 public enum ImageFilters {
     /// Shared thread-safe `CIContext` for all Core Image operations.
+    /// Intermediate caching is disabled so editing large images does not accumulate
+    /// hundreds of megabytes of CoreImage GPU/CPU buffers.
     public static let sharedContext: CIContext = {
         let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
         return CIContext(options: [
             .workingColorSpace: colorSpace,
             .outputColorSpace: colorSpace,
-            .useSoftwareRenderer: false
+            .workingFormat: CIFormat.RGBA8,
+            .useSoftwareRenderer: false,
+            .cacheIntermediates: false
         ])
     }()
+
+    /// Releases any reclaimable Core Image caches held by `sharedContext`.
+    public static func clearCaches() {
+        sharedContext.clearCaches()
+    }
+
+    /// Downsamples `image` using CoreGraphics so its longest edge is at most `maxDimension` pixels.
+    /// Returns `image` unchanged if it already fits within `maxDimension`.
+    public static func downsample(_ image: CGImage, maxDimension: CGFloat) -> CGImage? {
+        let w = CGFloat(image.width)
+        let h = CGFloat(image.height)
+        guard w > 0, h > 0, maxDimension >= 1.0 else { return nil }
+        let longest = max(w, h)
+        if longest <= maxDimension {
+            return image
+        }
+        let scale = maxDimension / longest
+        let targetW = max(1, Int((w * scale).rounded()))
+        let targetH = max(1, Int((h * scale).rounded()))
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(
+            data: nil,
+            width: targetW,
+            height: targetH,
+            bitsPerComponent: 8,
+            bytesPerRow: targetW * 4,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            return nil
+        }
+        ctx.interpolationQuality = .medium
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: targetW, height: targetH))
+        return ctx.makeImage()
+    }
 
     /// Applies `preset` and `adjustments` to `cgImage` using the shared `CIContext`.
     public static func apply(
@@ -86,87 +125,92 @@ public enum ImageFilters {
             return cgImage
         }
 
-        let extent = CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height)
-        var current = CIImage(cgImage: cgImage)
+        return try autoreleasepool {
+            let extent = CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height)
+            var current = CIImage(cgImage: cgImage)
 
-        // 1. Apply FilterPreset
-        switch preset {
-        case .none:
-            break
-        case .mono:
-            current = applyNamedFilter("CIPhotoEffectMono", to: current)
-        case .noir:
-            current = applyNamedFilter("CIPhotoEffectNoir", to: current)
-        case .chrome:
-            current = applyNamedFilter("CIPhotoEffectChrome", to: current)
-        case .fade:
-            current = applyNamedFilter("CIPhotoEffectFade", to: current)
-        case .instant:
-            current = applyNamedFilter("CIPhotoEffectInstant", to: current)
-        case .process:
-            current = applyNamedFilter("CIPhotoEffectProcess", to: current)
-        case .transfer:
-            current = applyNamedFilter("CIPhotoEffectTransfer", to: current)
-        case .vivid:
-            current = applyNamedFilter("CIVibrance", to: current, parameters: ["inputAmount": 0.75])
-        case .warm:
-            current = applyTemperature(to: current, targetNeutralX: 8000)
-        case .cool:
-            current = applyTemperature(to: current, targetNeutralX: 5000)
-        }
+            // 1. Apply FilterPreset
+            switch preset {
+            case .none:
+                break
+            case .mono:
+                current = applyNamedFilter("CIPhotoEffectMono", to: current)
+            case .noir:
+                current = applyNamedFilter("CIPhotoEffectNoir", to: current)
+            case .chrome:
+                current = applyNamedFilter("CIPhotoEffectChrome", to: current)
+            case .fade:
+                current = applyNamedFilter("CIPhotoEffectFade", to: current)
+            case .instant:
+                current = applyNamedFilter("CIPhotoEffectInstant", to: current)
+            case .process:
+                current = applyNamedFilter("CIPhotoEffectProcess", to: current)
+            case .transfer:
+                current = applyNamedFilter("CIPhotoEffectTransfer", to: current)
+            case .vivid:
+                current = applyNamedFilter("CIVibrance", to: current, parameters: ["inputAmount": 0.75])
+            case .warm:
+                current = applyTemperature(to: current, targetNeutralX: 8000)
+            case .cool:
+                current = applyTemperature(to: current, targetNeutralX: 5000)
+            }
 
-        // 2. Apply Adjustments
-        if adjustments.brightness != 0.0 || adjustments.contrast != 1.0 || adjustments.saturation != 1.0 {
-            current = applyNamedFilter(
-                "CIColorControls",
-                to: current,
-                parameters: [
-                    kCIInputBrightnessKey: adjustments.brightness,
-                    kCIInputContrastKey: adjustments.contrast,
-                    kCIInputSaturationKey: adjustments.saturation
-                ]
-            )
-        }
+            // 2. Apply Adjustments
+            if adjustments.brightness != 0.0 || adjustments.contrast != 1.0 || adjustments.saturation != 1.0 {
+                current = applyNamedFilter(
+                    "CIColorControls",
+                    to: current,
+                    parameters: [
+                        kCIInputBrightnessKey: adjustments.brightness,
+                        kCIInputContrastKey: adjustments.contrast,
+                        kCIInputSaturationKey: adjustments.saturation
+                    ]
+                )
+            }
 
-        if adjustments.exposure != 0.0 {
-            current = applyNamedFilter(
-                "CIExposureAdjust",
-                to: current,
-                parameters: [kCIInputEVKey: adjustments.exposure]
-            )
-        }
+            if adjustments.exposure != 0.0 {
+                current = applyNamedFilter(
+                    "CIExposureAdjust",
+                    to: current,
+                    parameters: [kCIInputEVKey: adjustments.exposure]
+                )
+            }
 
-        if adjustments.warmth != 0.0 {
-            // Map warmth (-1...1) to temperature shift around 6500K
-            let targetTemp = 6500.0 + (adjustments.warmth * 2000.0)
-            current = applyTemperature(to: current, targetNeutralX: targetTemp)
-        }
+            if adjustments.warmth != 0.0 {
+                // Map warmth (-1...1) to temperature shift around 6500K
+                let targetTemp = 6500.0 + (adjustments.warmth * 2000.0)
+                current = applyTemperature(to: current, targetNeutralX: targetTemp)
+            }
 
-        if adjustments.sharpness > 0.0 {
-            current = applyNamedFilter(
-                "CISharpenLuminance",
-                to: current,
-                parameters: [kCIInputSharpnessKey: adjustments.sharpness]
-            )
-        }
+            if adjustments.sharpness > 0.0 {
+                current = applyNamedFilter(
+                    "CISharpenLuminance",
+                    to: current,
+                    parameters: [kCIInputSharpnessKey: adjustments.sharpness]
+                )
+            }
 
-        if adjustments.vignette > 0.0 {
-            let radius = max(extent.width, extent.height) * 0.55
-            current = applyNamedFilter(
-                "CIVignette",
-                to: current,
-                parameters: [
-                    kCIInputIntensityKey: adjustments.vignette,
-                    kCIInputRadiusKey: radius
-                ]
-            )
-        }
+            if adjustments.vignette > 0.0 {
+                let radius = max(extent.width, extent.height) * 0.55
+                current = applyNamedFilter(
+                    "CIVignette",
+                    to: current,
+                    parameters: [
+                        kCIInputIntensityKey: adjustments.vignette,
+                        kCIInputRadiusKey: radius
+                    ]
+                )
+            }
 
-        let cropped = current.cropped(to: extent)
-        guard let output = sharedContext.createCGImage(cropped, from: extent) else {
-            throw FilterError.renderFailed
+            let cropped = current.cropped(to: extent)
+            guard let output = sharedContext.createCGImage(cropped, from: extent) else {
+                throw FilterError.renderFailed
+            }
+            if cgImage.width * cgImage.height >= 262_144 {
+                sharedContext.clearCaches()
+            }
+            return output
         }
-        return output
     }
 
     private static func applyNamedFilter(

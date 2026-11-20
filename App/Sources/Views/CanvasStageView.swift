@@ -11,6 +11,7 @@ struct CanvasStageView: View {
     let onOpenFile: () -> Void
     let onPaste: () -> Void
 
+    @Environment(\.displayScale) private var backingScaleFactor
     @State private var isDropTargeted: Bool = false
     @State private var pinchStartScale: CGFloat?
     @State private var pinchStartPan: CGSize?
@@ -42,11 +43,13 @@ struct CanvasStageView: View {
                     emptyStateView
                 } else {
                     ZStack {
-                        // Transparency checkerboard + rendered composite image (or 60fps live GPU transform split)
+                        // Transparency checkerboard + rendered composite image (or 60fps live GPU transform / dirty-rect eraser preview)
                         ZStack {
                             CheckerboardView()
 
-                            if let preview = model.liveTransformPreview {
+                            if let eraserPreview = model.liveEraserPreview {
+                                liveEraserComposite(preview: eraserPreview, layout: layout)
+                            } else if let preview = model.liveTransformPreview {
                                 liveTransformComposite(preview: preview, layout: layout)
                             } else if let rendered = model.renderedImage {
                                 Image(decorative: rendered, scale: 1.0)
@@ -56,7 +59,11 @@ struct CanvasStageView: View {
                         }
                         .frame(width: layout.frame.width, height: layout.frame.height)
                         .clipped()
-                        .shadow(color: .black.opacity(0.22), radius: 14, y: 4)
+                        .background(
+                            Rectangle()
+                                .fill(Color(nsColor: .controlBackgroundColor))
+                                .shadow(color: .black.opacity(0.22), radius: 14, y: 4)
+                        )
                         .position(x: layout.frame.midX, y: layout.frame.midY)
                         .onTapGesture(count: 2) {
                             guard model.activeTool == .move else { return }
@@ -169,6 +176,7 @@ struct CanvasStageView: View {
                             .onEnded { _ in
                                 pinchStartScale = nil
                                 pinchStartPan = nil
+                                updatePreviewTargetSize(for: layout)
                             }
                     )
                 }
@@ -230,9 +238,15 @@ struct CanvasStageView: View {
             .coordinateSpace(name: "canvasStage")
             .onAppear {
                 model.viewport.updateFitScale(layout.fitScale)
+                updatePreviewTargetSize(for: layout)
             }
             .onChange(of: layout.fitScale) { _, newFit in
                 model.viewport.updateFitScale(newFit)
+            }
+            .onChange(of: layout.frame.size) { _, _ in
+                if pinchStartScale == nil {
+                    updatePreviewTargetSize(for: layout)
+                }
             }
             .onDrop(of: [.recorteTrayDocument, .fileURL, .image], isTargeted: $isDropTargeted) { providers, location in
                 let canvasPt: CGPoint? = !model.hasCanvasSurface ? nil : CGPoint(
@@ -240,6 +254,46 @@ struct CanvasStageView: View {
                     y: (location.y - layout.frame.minY) / max(layout.scale, 0.01)
                 )
                 return handleDrop(providers: providers, canvasPoint: canvasPt)
+            }
+        }
+    }
+
+    private func updatePreviewTargetSize(for layout: CanvasLayout) {
+        let factor = max(1.0, backingScaleFactor)
+        let pixelSize = CGSize(
+            width: layout.frame.width * factor,
+            height: layout.frame.height * factor
+        )
+        model.updatePreviewTargetPixelSize(pixelSize)
+    }
+
+    @ViewBuilder
+    private func liveEraserComposite(preview: LiveEraserPreview, layout: CanvasLayout) -> some View {
+        let canvas = preview.canvas
+        let layerW = max(1.0, canvas.imageSize.width * layout.scale)
+        let layerH = max(1.0, canvas.imageSize.height * layout.scale)
+        let posX = canvas.layerTransform.position.x * layout.scale
+        let posY = canvas.layerTransform.position.y * layout.scale
+
+        ZStack {
+            if let underlay = preview.underlay {
+                Image(decorative: underlay, scale: 1.0)
+                    .resizable()
+                    .interpolation(.high)
+            }
+
+            LiveEraserLayerContainerView(canvas: canvas)
+                .frame(width: layerW, height: layerH)
+                .modifier(LiveEraserFrameClipModifier(frame: canvas.layerFrame, displayScale: layout.scale))
+                .scaleEffect(x: canvas.layerTransform.scale.width, y: canvas.layerTransform.scale.height)
+                .rotationEffect(.degrees(canvas.layerTransform.rotationDegrees))
+                .opacity(canvas.layerOpacity)
+                .position(x: posX, y: posY)
+
+            if let overlay = preview.overlay {
+                Image(decorative: overlay, scale: 1.0)
+                    .resizable()
+                    .interpolation(.high)
             }
         }
     }
@@ -416,6 +470,130 @@ struct CanvasStageView: View {
             }
         }
         return true
+    }
+}
+
+private struct LiveEraserFrameClipModifier: ViewModifier {
+    let frame: ImageFrame
+    let displayScale: CGFloat
+
+    func body(content: Content) -> some View {
+        if case .roundedCorners(let radius) = frame, radius > 0 {
+            content.clipShape(RoundedRectangle(cornerRadius: CGFloat(radius) * displayScale, style: .continuous))
+        } else {
+            content
+        }
+    }
+}
+
+/// Isolates observation of `canvas.revision` so ONLY the active layer view updates during eraser drags,
+/// avoiding re-evaluation of `CanvasStageView`, `CheckerboardView`, and glass overlays per drag event.
+private struct LiveEraserLayerContainerView: View {
+    let canvas: LiveEraserCanvas
+
+    var body: some View {
+        LiveEraserLayerView(canvas: canvas, revision: canvas.revision)
+    }
+}
+
+private struct LiveEraserLayerView: NSViewRepresentable {
+    let canvas: LiveEraserCanvas
+    let revision: Int
+
+    func makeNSView(context: Context) -> LiveEraserHostNSView {
+        let view = LiveEraserHostNSView(canvas: canvas)
+        view.needsDisplay = true
+        return view
+    }
+
+    func updateNSView(_ nsView: LiveEraserHostNSView, context: Context) {
+        nsView.update(canvas: canvas, revision: revision)
+    }
+}
+
+private final class LiveEraserHostNSView: NSView {
+    private var canvas: LiveEraserCanvas
+    private var lastRevision: Int = -1
+
+    override var isFlipped: Bool { true }
+    override var isOpaque: Bool { false }
+
+    init(canvas: LiveEraserCanvas) {
+        self.canvas = canvas
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.isOpaque = false
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func update(canvas newCanvas: LiveEraserCanvas, revision: Int) {
+        if self.canvas !== newCanvas {
+            self.canvas = newCanvas
+            self.lastRevision = revision
+            _ = newCanvas.consumePendingDirtyRect()
+            needsDisplay = true
+            return
+        }
+        guard revision != lastRevision else { return }
+        lastRevision = revision
+
+        if let dirty = newCanvas.consumePendingDirtyRect(), bounds.width > 0, bounds.height > 0 {
+            let sx = bounds.width / CGFloat(max(1, newCanvas.previewWidth))
+            let sy = bounds.height / CGFloat(max(1, newCanvas.previewHeight))
+            let viewRect = CGRect(
+                x: floor(CGFloat(dirty.minX) * sx) - 1.0,
+                y: floor(CGFloat(dirty.minY) * sy) - 1.0,
+                width: ceil(CGFloat(dirty.width) * sx) + 2.0,
+                height: ceil(CGFloat(dirty.height) * sy) + 2.0
+            ).intersection(bounds)
+            if !viewRect.isNull && !viewRect.isEmpty {
+                setNeedsDisplay(viewRect)
+            }
+        } else {
+            needsDisplay = true
+        }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let ctx = NSGraphicsContext.current?.cgContext,
+              bounds.width > 0, bounds.height > 0 else { return }
+
+        let pw = CGFloat(max(1, canvas.previewWidth))
+        let ph = CGFloat(max(1, canvas.previewHeight))
+        let sx = bounds.width / pw
+        let sy = bounds.height / ph
+
+        let clipped = dirtyRect.intersection(bounds)
+        guard !clipped.isNull, !clipped.isEmpty else { return }
+
+        let pxMin = max(0, Int(floor(clipped.minX / sx)) - 1)
+        let pxMax = min(canvas.previewWidth - 1, Int(ceil(clipped.maxX / sx)) + 1)
+        let pyMin = max(0, Int(floor(clipped.minY / sy)) - 1)
+        let pyMax = min(canvas.previewHeight - 1, Int(ceil(clipped.maxY / sy)) + 1)
+        guard pxMin <= pxMax, pyMin <= pyMax else { return }
+
+        let pixelRect = PixelDirtyRect(minX: pxMin, maxX: pxMax, minY: pyMin, maxY: pyMax)
+        guard let tile = canvas.makeTileImage(for: pixelRect) else { return }
+
+        let drawRect = CGRect(
+            x: CGFloat(pxMin) * sx,
+            y: CGFloat(pyMin) * sy,
+            width: CGFloat(pixelRect.width) * sx,
+            height: CGFloat(pixelRect.height) * sy
+        )
+
+        ctx.saveGState()
+        ctx.clip(to: clipped)
+        ctx.setBlendMode(.copy)
+        ctx.interpolationQuality = .high
+        ctx.translateBy(x: 0, y: drawRect.minY + drawRect.maxY)
+        ctx.scaleBy(x: 1.0, y: -1.0)
+        ctx.draw(tile, in: drawRect)
+        ctx.restoreGState()
     }
 }
 

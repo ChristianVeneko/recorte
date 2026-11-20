@@ -447,9 +447,7 @@ struct ContextualInspectorView: View {
                                     .resizable()
                                     .scaledToFill()
                             } else {
-                                Image(decorative: image.cgImage, scale: 1.0)
-                                    .resizable()
-                                    .scaledToFill()
+                                Color(nsColor: .controlBackgroundColor)
                             }
                         }
                         .frame(height: 44)
@@ -688,36 +686,8 @@ struct ContextualInspectorView: View {
         guard objID != filterThumbnailSourceID else { return }
         filterThumbnailSourceID = objID
 
-        let downscaled = downsample(sourceCG, maxDimension: 96) ?? sourceCG
-        var generated: [FilterPreset: CGImage] = [:]
-        for preset in FilterPreset.allCases {
-            if let filtered = try? ImageFilters.apply(to: downscaled, preset: preset) {
-                generated[preset] = filtered
-            }
-        }
-        filterThumbnails = generated
-    }
-
-    private func downsample(_ image: CGImage, maxDimension: CGFloat) -> CGImage? {
-        let w = CGFloat(image.width)
-        let h = CGFloat(image.height)
-        guard w > 0, h > 0 else { return nil }
-        let scale = min(1.0, maxDimension / max(w, h))
-        let targetW = max(1, Int((w * scale).rounded()))
-        let targetH = max(1, Int((h * scale).rounded()))
-        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
-        guard let ctx = CGContext(
-            data: nil,
-            width: targetW,
-            height: targetH,
-            bitsPerComponent: 8,
-            bytesPerRow: targetW * 4,
-            space: colorSpace,
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else { return nil }
-        ctx.interpolationQuality = .medium
-        ctx.draw(image, in: CGRect(x: 0, y: 0, width: targetW, height: targetH))
-        return ctx.makeImage()
+        // Computed once per source image from a single 160 px downsample via bounded cache (S28).
+        filterThumbnails = ImageThumbnailCache.filterThumbnails(for: sourceCG, maxDimension: 160)
     }
 
     // MARK: - Text Inspector (S16: Gradient Fill + Speech Bubbles)

@@ -1,12 +1,13 @@
 import AppKit
 import CoreGraphics
+import Darwin
 import Foundation
 import RecorteCore
 import RecorteIO
 import Testing
 @testable import Recorte
 
-@Suite("S23 Manual Brush Eraser App Tests")
+@Suite("S23 Manual Brush Eraser App Tests", .serialized)
 @MainActor
 struct EraserAppTests {
 
@@ -229,5 +230,198 @@ struct EraserAppTests {
         model.beginEraserStroke(at: CGPoint(x: 85, y: 110))
         model.endEraserStroke()
         #expect(model.document == snapshotBeforeLocked)
+    }
+
+    @Test("S27: 200 synthetic eraser drag points on a 2000x2000 image complete under 0.5 s with zero per-drag document rerenders")
+    func eraser200DragPointsOn2000x2000UnderHalfSecond() async throws {
+        let model = EditorModel()
+        let largeImg = makeSolidImage(width: 2000, height: 2000, r: 40, g: 130, b: 220, a: 255)
+        model.pasteImage(ImportedImage(image: largeImg, suggestedName: "LargePhoto"))
+
+        model.activeTool = .eraser
+        model.eraserMode = .erase
+        model.eraserBrushSize = 44
+        model.eraserHardness = 0.6
+
+        let points: [CGPoint] = (0..<200).map { i in
+            let t = CGFloat(i) / 199.0
+            let x = 200.0 + t * 1600.0
+            let y = 1000.0 + sin(t * .pi * 4.0) * 260.0
+            return CGPoint(x: x, y: y)
+        }
+
+        let rendersBeforeDrag = model.renderCount
+        let start = CFAbsoluteTimeGetCurrent()
+
+        model.beginEraserStroke(at: points[0])
+        #expect(model.liveEraserPreview != nil)
+        for pt in points.dropFirst() {
+            model.continueEraserStroke(to: pt)
+        }
+        let dragElapsed = CFAbsoluteTimeGetCurrent() - start
+
+        // Never re-render the whole document per drag event on the main thread
+        #expect(model.renderCount == rendersBeforeDrag, "Expected 0 full-doc rerenders during drag, got \(model.renderCount - rendersBeforeDrag)")
+
+        // Off-main-thread full-res apply on stroke end
+        await model.endEraserStrokeAsync()
+        let totalElapsed = CFAbsoluteTimeGetCurrent() - start
+
+        #expect(model.liveEraserPreview == nil, "Expected live preview / split cache to be dropped after stroke end")
+        #expect(model.renderCount == rendersBeforeDrag + 1)
+        print(String(format: "S27_APP_ERASER_TIMING: drag=%.4fs total=%.4fs", dragElapsed, totalElapsed))
+        #expect(totalElapsed < 0.5, "Expected 200 eraser drag points + full-res apply on 2000x2000 in < 0.5 s (drag=\(dragElapsed)s, total=\(totalElapsed)s)")
+
+        let rendered = try #require(model.renderComposite())
+        #expect(rendered.width == 2000 && rendered.height == 2000)
+        // Start and end points of the sine wave are erased at full resolution; far corner untouched
+        #expect(pixelAt(x: 200, y: 1000, in: rendered).a == 0)
+        #expect(pixelAt(x: 1800, y: 1000, in: rendered).a == 0)
+        #expect(pixelAt(x: 50, y: 50, in: rendered).a == 255)
+
+        // Single-step stroke-record undo restores original untouched mask
+        model.undo()
+        if case .image(let restoredImg) = model.selectedLayer?.kind {
+            #expect(restoredImg.alphaMask == nil)
+        } else {
+            Issue.record("Expected image layer after undo")
+        }
+        model.redo()
+        if case .image(let redoneImg) = model.selectedLayer?.kind {
+            #expect(redoneImg.alphaMask != nil)
+        }
+    }
+
+    @Test("S28: Preview downsampling, 160 px filter/tray thumbnails, capped undo, and split cache cleanup")
+    func memoryOptimizationsPreviewThumbnailsUndoCapAndSplitDrop() throws {
+        let model = EditorModel()
+        let largeImg = makeSolidImage(width: 1400, height: 1400, r: 200, g: 80, b: 40, a: 255)
+        model.pasteImage(ImportedImage(image: largeImg, suggestedName: "Big1400"))
+
+        // Capped undo history
+        #expect(model.undoManager.levelsOfUndo > 0 && model.undoManager.levelsOfUndo <= EditorModel.maxUndoLevels)
+
+        // Filter thumbnails computed once from a 160 px downsample
+        let thumbs1 = ImageThumbnailCache.filterThumbnails(for: largeImg, maxDimension: 160)
+        let thumbs2 = ImageThumbnailCache.filterThumbnails(for: largeImg, maxDimension: 160)
+        #expect(thumbs1.count == FilterPreset.allCases.count)
+        for (_, thumb) in thumbs1 {
+            #expect(max(thumb.width, thumb.height) <= 160)
+        }
+        #expect(thumbs1[.noir] === thumbs2[.noir])
+
+        // Tray thumbnail is bounded to <= 160 px
+        let tray = try #require(model.trayThumbnail)
+        #expect(max(tray.width, tray.height) <= 160)
+
+        // On-screen preview downsamples to view pixel size while renderComposite stays full-res 1400x1400
+        model.updatePreviewTargetPixelSize(CGSize(width: 700, height: 700))
+        let preview = try #require(model.renderedImage)
+        #expect(preview.width <= 710 && preview.height <= 710)
+        let fullExport = try #require(model.renderComposite())
+        #expect(fullExport.width == 1400 && fullExport.height == 1400)
+
+        // Live transform split is created during drag and dropped immediately on end or tool switch
+        let layerID = try #require(model.selectedLayer?.id)
+        model.beginLiveTransform(for: layerID)
+        #expect(model.liveTransformPreview != nil)
+        #expect((model.liveTransformPreview?.split.activeLayerImage.width ?? 9999) <= 710)
+        model.endLiveTransform(actionName: "Move")
+        #expect(model.liveTransformPreview == nil)
+
+        model.beginLiveTransform(for: layerID)
+        #expect(model.liveTransformPreview != nil)
+        model.activeTool = .eraser
+        #expect(model.liveTransformPreview == nil)
+    }
+
+    @Test("S28: Heavy editing session on a 1400x1400 image keeps phys_footprint delta bounded (< 120 MB)")
+    func heavyEditing1400x1400MemoryDeltaIsBounded() throws {
+        func currentFootprintMB() -> Double {
+            var info = task_vm_info_data_t()
+            var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size) / 4
+            let _ = withUnsafeMutablePointer(to: &info) { ptr in
+                ptr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { intPtr in
+                    task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), intPtr, &count)
+                }
+            }
+            return Double(info.phys_footprint) / (1024.0 * 1024.0)
+        }
+
+        ImageFilters.clearCaches()
+        let beforeMB = currentFootprintMB()
+
+        let model = EditorModel()
+        model.updatePreviewTargetPixelSize(CGSize(width: 900, height: 900))
+        let img1400 = makeSolidImage(width: 1400, height: 1400, r: 90, g: 140, b: 210, a: 255)
+        model.pasteImage(ImportedImage(image: img1400, suggestedName: "Photo1400"))
+        let layerID = try #require(model.selectedLayer?.id)
+
+        // 1. Compute inspector filter thumbnails (160px) and cycle all filter presets
+        _ = ImageThumbnailCache.filterThumbnails(for: img1400, maxDimension: 160)
+        for preset in FilterPreset.allCases {
+            autoreleasepool {
+                model.setFilterPreset(preset, for: layerID)
+            }
+        }
+        model.setFilterPreset(.vivid, for: layerID)
+
+        // 2. Simulate 20 continuous adjustment drags
+        for step in 0..<20 {
+            autoreleasepool {
+                let v = Double(step) * 0.02
+                model.setAdjustments(Adjustments(brightness: v * 0.5, contrast: 1.0 + v, saturation: 1.0 + v), for: layerID, continuous: true)
+            }
+        }
+        model.endContinuousEdit(actionName: "Adjust Image")
+
+        // 3. Perform 12 interactive eraser/restore strokes (40 drag points each) without yielding MainActor
+        model.activeTool = .eraser
+        model.eraserBrushSize = 48
+        model.eraserHardness = 0.5
+        for s in 0..<12 {
+            autoreleasepool {
+                model.eraserMode = s.isMultiple(of: 3) ? .restore : .erase
+                let y = CGFloat(150 + s * 90)
+                model.beginEraserStroke(at: CGPoint(x: 150, y: y))
+                for i in 1..<40 {
+                    let x = 150.0 + CGFloat(i) * 28.0
+                    model.continueEraserStroke(to: CGPoint(x: x, y: y + sin(CGFloat(i) * 0.3) * 18.0))
+                }
+                model.endEraserStroke()
+            }
+        }
+
+        // 4. Perform 8 live transform drags (split cache created & dropped)
+        model.activeTool = .move
+        for step in 0..<8 {
+            autoreleasepool {
+                model.beginLiveTransform(for: layerID, isRotating: true)
+                var t = model.document.layer(id: layerID)!.transform
+                t.rotationDegrees = Double(step * 5)
+                model.updateLiveTransform(t, isRotating: true)
+                model.endLiveTransform(actionName: "Rotate")
+            }
+        }
+
+        // 5. Perform 15 destructive bitmap edits (clone stamps) to exercise undo cap & LZFSE compaction
+        for step in 0..<15 {
+            try autoreleasepool {
+                let dst = CGPoint(x: 200 + step * 50, y: 200 + step * 40)
+                try model.applyCloneStamp(from: CGPoint(x: 700, y: 700), to: dst, radius: 40)
+            }
+        }
+        for _ in 0..<5 { model.undo() }
+        for _ in 0..<5 { model.redo() }
+
+        #expect(model.liveTransformPreview == nil)
+        #expect(model.liveEraserPreview == nil)
+
+        // Drain any pending CoreImage Metal scratch buffers before sampling steady-state delta.
+        ImageFilters.clearCaches()
+        let footprintMB = currentFootprintMB()
+        let deltaMB = footprintMB - beforeMB
+        print(String(format: "S28_HEAVY_1400_PHYS_FOOTPRINT: before=%.1f MB after=%.1f MB delta=%.1f MB", beforeMB, footprintMB, deltaMB))
+        #expect(deltaMB < 120.0, "Expected heavy 1400x1400 editing delta < 120 MB, got \(deltaMB) MB (before=\(beforeMB), after=\(footprintMB))")
     }
 }

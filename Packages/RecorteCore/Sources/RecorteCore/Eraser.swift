@@ -1,3 +1,4 @@
+import Accelerate
 import Foundation
 import CoreGraphics
 
@@ -236,28 +237,31 @@ public enum ImageEraser {
         height: Int,
         stroke: EraserStroke
     ) throws -> CGImage {
+        try applyStrokesToMask(mask, width: width, height: height, strokes: [stroke])
+    }
+
+    /// Replays a sequence of erase/restore strokes onto `mask` (`nil` = all opaque 255) in a single
+    /// bitmap pass using tight per-stroke bounding-box rasterization.
+    public static func applyStrokesToMask(
+        _ mask: CGImage?,
+        width: Int,
+        height: Int,
+        strokes: [EraserStroke]
+    ) throws -> CGImage {
         guard width > 0, height > 0 else {
             throw ImageToolError.invalidDimensions
         }
-        guard stroke.brushSize > 0 else {
-            throw ImageToolError.invalidParameters
+        for stroke in strokes {
+            guard stroke.brushSize > 0 else {
+                throw ImageToolError.invalidParameters
+            }
         }
 
-        var maskBytes = try readGrayscaleMaskBytes(mask, width: width, height: height)
-        guard !stroke.points.isEmpty else {
-            return try makeGrayscaleMaskImage(bytes: maskBytes, width: width, height: height)
+        var maskData = try readGrayscaleMaskData(mask, width: width, height: height)
+        for stroke in strokes where !stroke.points.isEmpty {
+            applySingleStrokeInPlace(stroke, width: width, height: height, maskData: &maskData)
         }
-
-        let coverage = rasterizeStrokeCoverage(
-            points: stroke.points,
-            width: width,
-            height: height,
-            brushSize: stroke.brushSize,
-            hardness: stroke.hardness
-        )
-
-        combineMask(base: maskBytes, coverage: coverage, mode: stroke.mode, into: &maskBytes)
-        return try makeGrayscaleMaskImage(bytes: maskBytes, width: width, height: height)
+        return try makeGrayscaleMaskImage(data: maskData, width: width, height: height)
     }
 
     /// Composites an 8-bit grayscale `alphaMask` onto `image` by multiplying premultiplied RGBA
@@ -269,55 +273,300 @@ public enum ImageEraser {
             throw ImageToolError.invalidDimensions
         }
 
-        var rgba = try readPremultipliedRGBABytes(image)
-        let maskBytes = try readGrayscaleMaskBytes(alphaMask, width: w, height: h)
-
-        rgba.withUnsafeMutableBufferPointer { dst in
-            maskBytes.withUnsafeBufferPointer { mask in
-                for idx in 0..<(w * h) {
-                    let m = Int(mask[idx])
-                    if m == 255 { continue }
-                    let base = idx * 4
-                    if m == 0 {
-                        dst[base] = 0
-                        dst[base + 1] = 0
-                        dst[base + 2] = 0
-                        dst[base + 3] = 0
-                    } else {
-                        dst[base]     = UInt8((Int(dst[base]) * m + 127) / 255)
-                        dst[base + 1] = UInt8((Int(dst[base + 1]) * m + 127) / 255)
-                        dst[base + 2] = UInt8((Int(dst[base + 2]) * m + 127) / 255)
-                        dst[base + 3] = UInt8((Int(dst[base + 3]) * m + 127) / 255)
-                    }
-                }
+        return try autoreleasepool {
+            let fullRect = CGRect(x: 0, y: 0, width: CGFloat(w), height: CGFloat(h))
+            guard let ctx = CGContext(
+                data: nil,
+                width: w,
+                height: h,
+                bitsPerComponent: 8,
+                bytesPerRow: w * 4,
+                space: sRGBColorSpace(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else {
+                throw ImageToolError.contextCreationFailed
             }
+            ctx.clear(fullRect)
+            ctx.clip(to: fullRect, mask: alphaMask)
+            ctx.draw(image, in: fullRect)
+            guard let output = ctx.makeImage() else {
+                throw ImageToolError.renderFailed
+            }
+            return output
         }
-
-        return try makePremultipliedRGBAImage(bytes: rgba, width: w, height: h)
     }
 
     // MARK: - Internal Rasterization Primitives
 
-    internal struct BrushMetrics {
-        let radius: CGFloat
-        let radiusSq: CGFloat
-        let innerRadius: CGFloat
-        let innerRadiusSq: CGFloat
-        let falloffSpan: CGFloat
+    internal struct BrushMetrics: Sendable {
+        let radius: Float
+        let radiusSq: Float
+        let innerRadius: Float
+        let innerRadiusSq: Float
+        let invFalloffSpan: Float
 
         init(brushSize: CGFloat, hardness: CGFloat) {
-            let r = max(0.5, brushSize * 0.5)
-            let clampedHardness = min(max(hardness, 0.0), 1.0)
-            // Keep a crisp ~0.75px anti-aliased fringe at hardness == 1.0, and a tiny subpixel center core
-            // (~0.6px) so the pixel directly on the stroke centerline reaches full 100% erasure even at hardness == 0.
-            let maxInner = r > 1.0 ? max(0.0, r - 0.75) : 0.0
-            let minCenterCore = r >= 2.0 ? min(0.6, r * 0.15) : 0.0
+            let r = Float(max(0.5, brushSize * 0.5))
+            let clampedHardness = Float(min(max(hardness, 0.0), 1.0))
+            // Keep a crisp ~0.75px anti-aliased fringe at hardness == 1.0, and a center core wide enough
+            // to guarantee full 100% erasure along the centerline between adjacent brush dabs even at hardness == 0.
+            let maxInner: Float = r > 1.0 ? max(0.0, r - 0.75) : 0.0
+            let dabHalfSpacing = Float(max(1.0, min(brushSize * 0.12, 4.0)) * 0.5) + 0.75
+            let minCenterCore: Float = r >= 2.0 ? min(dabHalfSpacing, r * 0.22) : 0.0
             let inner = min(max(r * clampedHardness, minCenterCore), maxInner)
             self.radius = r
             self.radiusSq = r * r
             self.innerRadius = inner
             self.innerRadiusSq = inner * inner
-            self.falloffSpan = max(0.001, r - inner)
+            self.invFalloffSpan = 1.0 / max(0.001, r - inner)
+        }
+    }
+
+    private static func strokeBoundingBox(
+        points: [CGPoint],
+        radius: Float,
+        width: Int,
+        height: Int
+    ) -> (minX: Int, maxX: Int, minY: Int, maxY: Int)? {
+        guard let first = points.first else { return nil }
+        var minPx = first.x
+        var maxPx = first.x
+        var minPy = first.y
+        var maxPy = first.y
+        for pt in points.dropFirst() {
+            if pt.x < minPx { minPx = pt.x }
+            if pt.x > maxPx { maxPx = pt.x }
+            if pt.y < minPy { minPy = pt.y }
+            if pt.y > maxPy { maxPy = pt.y }
+        }
+        let pad = CGFloat(radius) + 2.0
+        let minX = max(0, Int(floor(minPx - pad)))
+        let maxX = min(width - 1, Int(ceil(maxPx + pad)))
+        let minY = max(0, Int(floor(minPy - pad)))
+        let maxY = min(height - 1, Int(ceil(maxPy + pad)))
+        guard minX <= maxX, minY <= maxY else { return nil }
+        return (minX, maxX, minY, maxY)
+    }
+
+    internal static func makeBrushTipImage(brushSize: CGFloat, hardness: CGFloat) -> (image: CGImage, size: CGFloat)? {
+        let metrics = BrushMetrics(brushSize: brushSize, hardness: hardness)
+        let dim = max(2, Int(ceil(CGFloat(metrics.radius) * 2.0)) + 2)
+        let center = Float(dim) * 0.5
+        let rSq = metrics.radiusSq
+        let innerR = metrics.innerRadius
+        let innerRSq = metrics.innerRadiusSq
+        let invSpan = metrics.invFalloffSpan
+
+        var data = Data(count: dim * dim)
+        data.withUnsafeMutableBytes { rawBuf in
+            guard let ptr = rawBuf.bindMemory(to: UInt8.self).baseAddress else { return }
+            for y in 0..<dim {
+                let dy = (Float(y) + 0.5) - center
+                let dySq = dy * dy
+                let row = y * dim
+                for x in 0..<dim {
+                    let dx = (Float(x) + 0.5) - center
+                    let distSq = dx * dx + dySq
+                    if distSq >= rSq {
+                        ptr[row + x] = 0
+                    } else if distSq <= innerRSq {
+                        ptr[row + x] = 255
+                    } else {
+                        let dist = distSq.squareRoot()
+                        let tFalloff = (dist - innerR) * invSpan
+                        let u = max(0.0, min(1.0, 1.0 - tFalloff))
+                        let strength = u * u * (3.0 - 2.0 * u)
+                        ptr[row + x] = UInt8((strength * 255.0).rounded())
+                    }
+                }
+            }
+        }
+        guard let img = try? makeGrayscaleMaskImage(data: data, width: dim, height: dim) else {
+            return nil
+        }
+        return (img, CGFloat(dim))
+    }
+
+    internal static func combineMaskDirtyRectVImage(
+        base: UnsafePointer<UInt8>,
+        coverage: UnsafePointer<UInt8>,
+        mode: EraserMode,
+        width: Int,
+        rect: (minX: Int, maxX: Int, minY: Int, maxY: Int),
+        zeroScratch: inout [UInt8],
+        into output: UnsafeMutablePointer<UInt8>
+    ) {
+        let dirtyW = rect.maxX - rect.minX + 1
+        let dirtyH = rect.maxY - rect.minY + 1
+        guard dirtyW > 0, dirtyH > 0 else { return }
+
+        let startOffset = rect.minY * width + rect.minX
+        var srcBottom = vImage_Buffer(
+            data: UnsafeMutableRawPointer(mutating: base + startOffset),
+            height: vImagePixelCount(dirtyH),
+            width: vImagePixelCount(dirtyW),
+            rowBytes: width
+        )
+        var srcAlpha = vImage_Buffer(
+            data: UnsafeMutableRawPointer(mutating: coverage + startOffset),
+            height: vImagePixelCount(dirtyH),
+            width: vImagePixelCount(dirtyW),
+            rowBytes: width
+        )
+        var dst = vImage_Buffer(
+            data: UnsafeMutableRawPointer(output + startOffset),
+            height: vImagePixelCount(dirtyH),
+            width: vImagePixelCount(dirtyW),
+            rowBytes: width
+        )
+
+        switch mode {
+        case .erase:
+            let needed = dirtyW * dirtyH
+            if zeroScratch.count < needed {
+                zeroScratch = [UInt8](repeating: 0, count: needed)
+            }
+            zeroScratch.withUnsafeMutableBufferPointer { zBuf in
+                var srcTop = vImage_Buffer(
+                    data: UnsafeMutableRawPointer(zBuf.baseAddress!),
+                    height: vImagePixelCount(dirtyH),
+                    width: vImagePixelCount(dirtyW),
+                    rowBytes: dirtyW
+                )
+                _ = vImagePremultipliedAlphaBlend_Planar8(
+                    &srcTop,
+                    &srcAlpha,
+                    &srcBottom,
+                    &dst,
+                    vImage_Flags(kvImageNoFlags)
+                )
+            }
+        case .restore:
+            // Premultiplied white (255) with alpha = coverage equals coverage itself:
+            // dst = coverage + ((255 - coverage) * base + 127) / 255
+            var srcTop = srcAlpha
+            _ = vImagePremultipliedAlphaBlend_Planar8(
+                &srcTop,
+                &srcAlpha,
+                &srcBottom,
+                &dst,
+                vImage_Flags(kvImageNoFlags)
+            )
+        }
+    }
+
+    private static func applySingleStrokeInPlace(
+        _ stroke: EraserStroke,
+        width: Int,
+        height: Int,
+        maskData: inout Data
+    ) {
+        let metrics = BrushMetrics(brushSize: stroke.brushSize, hardness: stroke.hardness)
+        guard let box = strokeBoundingBox(
+            points: stroke.points,
+            radius: metrics.radius,
+            width: width,
+            height: height
+        ) else { return }
+
+        let boxW = box.maxX - box.minX + 1
+        let boxH = box.maxY - box.minY + 1
+        let originX = CGFloat(box.minX)
+        let originY = CGFloat(box.minY)
+
+        var localCoverage = [UInt8](repeating: 0, count: boxW * boxH)
+        let spacing = max(1.0, min(stroke.brushSize * 0.12, 4.0))
+        let smoothed = interpolatePoints(stroke.points, spacing: spacing)
+
+        let stampedViaCG: Bool = {
+            guard let tip = makeBrushTipImage(brushSize: stroke.brushSize, hardness: stroke.hardness) else {
+                return false
+            }
+            return localCoverage.withUnsafeMutableBytes { rawBuf -> Bool in
+                guard let ctx = CGContext(
+                    data: rawBuf.baseAddress,
+                    width: boxW,
+                    height: boxH,
+                    bitsPerComponent: 8,
+                    bytesPerRow: boxW,
+                    space: linearGrayColorSpace(),
+                    bitmapInfo: CGImageAlphaInfo.none.rawValue
+                ) else { return false }
+                ctx.translateBy(x: 0, y: CGFloat(boxH))
+                ctx.scaleBy(x: 1.0, y: -1.0)
+                ctx.setBlendMode(.lighten)
+                ctx.interpolationQuality = .low
+                let half = tip.size * 0.5
+                for pt in smoothed {
+                    let rect = CGRect(x: pt.x - originX - half, y: pt.y - originY - half, width: tip.size, height: tip.size)
+                    ctx.draw(tip.image, in: rect)
+                }
+                return true
+            }
+        }()
+
+        if !stampedViaCG {
+            if smoothed.count == 1 {
+                let p = CGPoint(x: smoothed[0].x - originX, y: smoothed[0].y - originY)
+                stampCapsule(from: p, to: p, metrics: metrics, width: boxW, height: boxH, coverage: &localCoverage)
+            } else {
+                var prev = CGPoint(x: smoothed[0].x - originX, y: smoothed[0].y - originY)
+                for i in 1..<smoothed.count {
+                    let curr = CGPoint(x: smoothed[i].x - originX, y: smoothed[i].y - originY)
+                    stampCapsule(from: prev, to: curr, metrics: metrics, width: boxW, height: boxH, coverage: &localCoverage)
+                    prev = curr
+                }
+            }
+        }
+
+        maskData.withUnsafeMutableBytes { rawDst in
+            guard let dstPtr = rawDst.bindMemory(to: UInt8.self).baseAddress else { return }
+            localCoverage.withUnsafeBufferPointer { covBuf in
+                guard let covPtr = covBuf.baseAddress else { return }
+                let startOffset = box.minY * width + box.minX
+                var srcBottom = vImage_Buffer(
+                    data: UnsafeMutableRawPointer(dstPtr + startOffset),
+                    height: vImagePixelCount(boxH),
+                    width: vImagePixelCount(boxW),
+                    rowBytes: width
+                )
+                var srcAlpha = vImage_Buffer(
+                    data: UnsafeMutableRawPointer(mutating: covPtr),
+                    height: vImagePixelCount(boxH),
+                    width: vImagePixelCount(boxW),
+                    rowBytes: boxW
+                )
+                var dst = srcBottom
+
+                switch stroke.mode {
+                case .erase:
+                    var zeros = [UInt8](repeating: 0, count: boxW * boxH)
+                    zeros.withUnsafeMutableBufferPointer { zBuf in
+                        var srcTop = vImage_Buffer(
+                            data: UnsafeMutableRawPointer(zBuf.baseAddress!),
+                            height: vImagePixelCount(boxH),
+                            width: vImagePixelCount(boxW),
+                            rowBytes: boxW
+                        )
+                        _ = vImagePremultipliedAlphaBlend_Planar8(
+                            &srcTop,
+                            &srcAlpha,
+                            &srcBottom,
+                            &dst,
+                            vImage_Flags(kvImageNoFlags)
+                        )
+                    }
+                case .restore:
+                    var srcTop = srcAlpha
+                    _ = vImagePremultipliedAlphaBlend_Planar8(
+                        &srcTop,
+                        &srcAlpha,
+                        &srcBottom,
+                        &dst,
+                        vImage_Flags(kvImageNoFlags)
+                    )
+                }
+            }
         }
     }
 
@@ -369,61 +618,87 @@ public enum ImageEraser {
         height: Int,
         coverage: inout [UInt8]
     ) -> (minX: Int, maxX: Int, minY: Int, maxY: Int)? {
-        let r = metrics.radius
+        let r = CGFloat(metrics.radius)
         let minX = max(0, Int(floor(min(a.x, b.x) - r - 1.0)))
         let maxX = min(width - 1, Int(ceil(max(a.x, b.x) + r + 1.0)))
         let minY = max(0, Int(floor(min(a.y, b.y) - r - 1.0)))
         let maxY = min(height - 1, Int(ceil(max(a.y, b.y) + r + 1.0)))
         guard minX <= maxX, minY <= maxY else { return nil }
 
-        let ax = a.x
-        let ay = a.y
-        let vx = b.x - ax
-        let vy = b.y - ay
+        let ax = Float(a.x)
+        let ay = Float(a.y)
+        let vx = Float(b.x) - ax
+        let vy = Float(b.y) - ay
         let lenSq = vx * vx + vy * vy
         let isPoint = lenSq < 1e-6
+        let invLenSq: Float = isPoint ? 0.0 : (1.0 / lenSq)
 
         let rSq = metrics.radiusSq
         let innerR = metrics.innerRadius
         let innerRSq = metrics.innerRadiusSq
-        let invSpan = 1.0 / metrics.falloffSpan
+        let invSpan = metrics.invFalloffSpan
 
-        coverage.withUnsafeMutableBufferPointer { cov in
-            for y in minY...maxY {
-                let py = CGFloat(y) + 0.5
-                let rowOffset = y * width
-                for x in minX...maxX {
-                    let px = CGFloat(x) + 0.5
-                    let distSq: CGFloat
-                    if isPoint {
-                        let dx = px - ax
-                        let dy = py - ay
-                        distSq = dx * dx + dy * dy
-                    } else {
-                        let proj = ((px - ax) * vx + (py - ay) * vy) / lenSq
-                        let t = proj < 0.0 ? 0.0 : (proj > 1.0 ? 1.0 : proj)
-                        let dx = px - (ax + t * vx)
-                        let dy = py - (ay + t * vy)
-                        distSq = dx * dx + dy * dy
+        coverage.withUnsafeMutableBufferPointer { covBuf in
+            guard let cov = covBuf.baseAddress else { return }
+            if isPoint {
+                for y in minY...maxY {
+                    let dy = (Float(y) + 0.5) - ay
+                    let dySq = dy * dy
+                    if dySq >= rSq { continue }
+                    let rowOffset = y * width
+                    for x in minX...maxX {
+                        let dx = (Float(x) + 0.5) - ax
+                        let distSq = dx * dx + dySq
+                        if distSq >= rSq { continue }
+
+                        let value: UInt8
+                        if distSq <= innerRSq {
+                            value = 255
+                        } else {
+                            let dist = distSq.squareRoot()
+                            let tFalloff = (dist - innerR) * invSpan
+                            let u = max(0.0, min(1.0, 1.0 - tFalloff))
+                            let strength = u * u * (3.0 - 2.0 * u)
+                            value = UInt8((strength * 255.0).rounded())
+                        }
+
+                        let idx = rowOffset + x
+                        if value > cov[idx] {
+                            cov[idx] = value
+                        }
                     }
+                }
+            } else {
+                for y in minY...maxY {
+                    let py = Float(y) + 0.5
+                    let pyMinusAy = py - ay
+                    let pyVy = pyMinusAy * vy
+                    let rowOffset = y * width
+                    for x in minX...maxX {
+                        let px = Float(x) + 0.5
+                        let pxMinusAx = px - ax
+                        let proj = (pxMinusAx * vx + pyVy) * invLenSq
+                        let t: Float = proj < 0.0 ? 0.0 : (proj > 1.0 ? 1.0 : proj)
+                        let dx = pxMinusAx - t * vx
+                        let dy = pyMinusAy - t * vy
+                        let distSq = dx * dx + dy * dy
+                        if distSq >= rSq { continue }
 
-                    if distSq >= rSq { continue }
+                        let value: UInt8
+                        if distSq <= innerRSq {
+                            value = 255
+                        } else {
+                            let dist = distSq.squareRoot()
+                            let tFalloff = (dist - innerR) * invSpan
+                            let u = max(0.0, min(1.0, 1.0 - tFalloff))
+                            let strength = u * u * (3.0 - 2.0 * u)
+                            value = UInt8((strength * 255.0).rounded())
+                        }
 
-                    let value: UInt8
-                    if distSq <= innerRSq {
-                        value = 255
-                    } else {
-                        let dist = sqrt(distSq)
-                        let tFalloff = (dist - innerR) * invSpan
-                        let u = max(0.0, min(1.0, 1.0 - tFalloff))
-                        // Cubic smoothstep for natural feathered falloff
-                        let strength = u * u * (3.0 - 2.0 * u)
-                        value = UInt8((strength * 255.0).rounded())
-                    }
-
-                    let idx = rowOffset + x
-                    if value > cov[idx] {
-                        cov[idx] = value
+                        let idx = rowOffset + x
+                        if value > cov[idx] {
+                            cov[idx] = value
+                        }
                     }
                 }
             }
@@ -438,20 +713,23 @@ public enum ImageEraser {
         into output: inout [UInt8]
     ) {
         let count = base.count
-        output.withUnsafeMutableBufferPointer { dst in
-            base.withUnsafeBufferPointer { src in
-                coverage.withUnsafeBufferPointer { cov in
+        output.withUnsafeMutableBufferPointer { dstBuf in
+            base.withUnsafeBufferPointer { srcBuf in
+                coverage.withUnsafeBufferPointer { covBuf in
+                    guard let dst = dstBuf.baseAddress,
+                          let src = srcBuf.baseAddress,
+                          let cov = covBuf.baseAddress else { return }
                     switch mode {
                     case .erase:
                         for idx in 0..<count {
                             let s = Int(cov[idx])
-                            guard s > 0 else { continue }
+                            if s == 0 { continue }
                             dst[idx] = UInt8((Int(src[idx]) * (255 - s) + 127) / 255)
                         }
                     case .restore:
                         for idx in 0..<count {
                             let s = Int(cov[idx])
-                            guard s > 0 else { continue }
+                            if s == 0 { continue }
                             let b = Int(src[idx])
                             dst[idx] = UInt8(b + ((255 - b) * s + 127) / 255)
                         }
@@ -469,9 +747,12 @@ public enum ImageEraser {
         rect: (minX: Int, maxX: Int, minY: Int, maxY: Int),
         into output: inout [UInt8]
     ) {
-        output.withUnsafeMutableBufferPointer { dst in
-            base.withUnsafeBufferPointer { src in
-                coverage.withUnsafeBufferPointer { cov in
+        output.withUnsafeMutableBufferPointer { dstBuf in
+            base.withUnsafeBufferPointer { srcBuf in
+                coverage.withUnsafeBufferPointer { covBuf in
+                    guard let dst = dstBuf.baseAddress,
+                          let src = srcBuf.baseAddress,
+                          let cov = covBuf.baseAddress else { return }
                     switch mode {
                     case .erase:
                         for y in rect.minY...rect.maxY {
@@ -510,13 +791,42 @@ public enum ImageEraser {
         CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
     }
 
-    internal static func readGrayscaleMaskBytes(_ mask: CGImage?, width: Int, height: Int) throws -> [UInt8] {
+    internal static func readGrayscaleMaskData(_ mask: CGImage?, width: Int, height: Int) throws -> Data {
+        let count = width * height
         guard let mask else {
-            return [UInt8](repeating: 255, count: width * height)
+            return Data(repeating: 255, count: count)
         }
-        var bytes = [UInt8](repeating: 255, count: width * height)
+
+        // Fast zero-CGContext path when mask is already an 8-bit grayscale bitmap of matching dimensions
+        if mask.width == width,
+           mask.height == height,
+           mask.bitsPerComponent == 8,
+           mask.bitsPerPixel == 8,
+           mask.alphaInfo == .none,
+           let cfData = mask.dataProvider?.data {
+            let srcBytesPerRow = mask.bytesPerRow
+            let srcLen = CFDataGetLength(cfData)
+            if srcBytesPerRow == width && srcLen >= count {
+                if let ptr = CFDataGetBytePtr(cfData) {
+                    return Data(bytes: ptr, count: count)
+                }
+            } else if srcBytesPerRow > width && srcLen >= srcBytesPerRow * height {
+                if let srcPtr = CFDataGetBytePtr(cfData) {
+                    var data = Data(count: count)
+                    data.withUnsafeMutableBytes { dstRaw in
+                        guard let dstPtr = dstRaw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+                        for row in 0..<height {
+                            memcpy(dstPtr + row * width, srcPtr + row * srcBytesPerRow, width)
+                        }
+                    }
+                    return data
+                }
+            }
+        }
+
+        var data = Data(repeating: 255, count: count)
         let graySpace = linearGrayColorSpace()
-        let ok = bytes.withUnsafeMutableBytes { ptr -> Bool in
+        let ok = data.withUnsafeMutableBytes { ptr -> Bool in
             guard let ctx = CGContext(
                 data: ptr.baseAddress,
                 width: width,
@@ -535,11 +845,15 @@ public enum ImageEraser {
         guard ok else {
             throw ImageToolError.contextCreationFailed
         }
-        return bytes
+        return data
     }
 
-    internal static func makeGrayscaleMaskImage(bytes: [UInt8], width: Int, height: Int) throws -> CGImage {
-        let data = Data(bytes)
+    internal static func readGrayscaleMaskBytes(_ mask: CGImage?, width: Int, height: Int) throws -> [UInt8] {
+        let data = try readGrayscaleMaskData(mask, width: width, height: height)
+        return [UInt8](data)
+    }
+
+    internal static func makeGrayscaleMaskImage(data: Data, width: Int, height: Int) throws -> CGImage {
         guard let provider = CGDataProvider(data: data as CFData),
               let image = CGImage(
                   width: width,
@@ -559,9 +873,20 @@ public enum ImageEraser {
         return image
     }
 
-    internal static func readPremultipliedRGBABytes(_ image: CGImage) throws -> [UInt8] {
-        let w = image.width
-        let h = image.height
+    internal static func makeGrayscaleMaskImage(bytes: [UInt8], width: Int, height: Int) throws -> CGImage {
+        try makeGrayscaleMaskImage(data: Data(bytes), width: width, height: height)
+    }
+
+    public static func readPremultipliedRGBABytes(
+        _ image: CGImage,
+        targetWidth: Int? = nil,
+        targetHeight: Int? = nil
+    ) throws -> [UInt8] {
+        let w = targetWidth ?? image.width
+        let h = targetHeight ?? image.height
+        guard w > 0, h > 0 else {
+            throw ImageToolError.invalidDimensions
+        }
         var bytes = [UInt8](repeating: 0, count: w * h * 4)
         let colorSpace = sRGBColorSpace()
         let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
@@ -577,6 +902,7 @@ public enum ImageEraser {
             ) else {
                 return false
             }
+            ctx.interpolationQuality = .medium
             ctx.clear(CGRect(x: 0, y: 0, width: w, height: h))
             ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
             return true
@@ -609,6 +935,325 @@ public enum ImageEraser {
     }
 }
 
+// MARK: - Persistent Dirty-Rect Alpha Mask Bitmap (S27 Fluid Eraser)
+
+/// Integer pixel bounding rectangle (inclusive bounds) returned by incremental brush updates.
+public struct PixelDirtyRect: Sendable, Equatable, Hashable {
+    public var minX: Int
+    public var maxX: Int
+    public var minY: Int
+    public var maxY: Int
+
+    public init(minX: Int, maxX: Int, minY: Int, maxY: Int) {
+        self.minX = minX
+        self.maxX = maxX
+        self.minY = minY
+        self.maxY = maxY
+    }
+
+    public var width: Int { max(0, maxX - minX + 1) }
+    public var height: Int { max(0, maxY - minY + 1) }
+
+    public var cgRect: CGRect {
+        CGRect(x: minX, y: minY, width: width, height: height)
+    }
+
+    public func union(_ other: PixelDirtyRect) -> PixelDirtyRect {
+        PixelDirtyRect(
+            minX: min(minX, other.minX),
+            maxX: max(maxX, other.maxX),
+            minY: min(minY, other.minY),
+            maxY: max(maxY, other.maxY)
+        )
+    }
+}
+
+/// Persistent, reference-backed 8-bit grayscale alpha-mask bitmap for fluid interactive eraser strokes.
+/// Paints strokes incrementally into ONLY the dirty bounding rectangle using CoreGraphics `.lighten`
+/// brush stamping and Accelerate `vImage` SIMD compositing, with zero per-move array copies
+/// and zero per-move `CGImage` allocations.
+public final class PersistentAlphaMask: @unchecked Sendable {
+    public let width: Int
+    public let height: Int
+
+    private var workingMaskBytes: [UInt8]
+    private var strokeBaseBytes: [UInt8]
+    private var coverageContext: CGContext
+    private var coveragePointer: UnsafeMutablePointer<UInt8>
+    private var zeroScratch: [UInt8] = []
+
+    private var activeBrushSize: CGFloat = 32.0
+    private var activeMode: EraserMode = .erase
+    private var activeBrushTip: CGImage?
+    private var activeBrushTipSize: CGFloat = 0.0
+    private var rawPoints: [CGPoint] = []
+    private var lastMidpoint: CGPoint?
+    private var strokeUnionDirty: PixelDirtyRect?
+    private var isStrokeActive: Bool = false
+
+    public init(baseMask: CGImage?, width: Int, height: Int) throws {
+        guard width > 0, height > 0 else {
+            throw ImageToolError.invalidDimensions
+        }
+        self.width = width
+        self.height = height
+        let initial = try ImageEraser.readGrayscaleMaskBytes(baseMask, width: width, height: height)
+        self.workingMaskBytes = initial
+        self.strokeBaseBytes = initial
+
+        guard let ctx = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width,
+            space: ImageEraser.linearGrayColorSpace(),
+            bitmapInfo: CGImageAlphaInfo.none.rawValue
+        ), let ptr = ctx.data?.assumingMemoryBound(to: UInt8.self) else {
+            throw ImageToolError.contextCreationFailed
+        }
+        memset(ptr, 0, width * height)
+        ctx.translateBy(x: 0, y: CGFloat(height))
+        ctx.scaleBy(x: 1.0, y: -1.0)
+        ctx.setBlendMode(.lighten)
+        ctx.interpolationQuality = .low
+        self.coverageContext = ctx
+        self.coveragePointer = ptr
+    }
+
+    /// Starts a new stroke, clearing only the previous stroke's dirty rect from the coverage buffer.
+    public func beginStroke(brushSize: CGFloat, hardness: CGFloat, mode: EraserMode) {
+        if let prevDirty = strokeUnionDirty {
+            clearCoverageAndSyncBase(in: prevDirty)
+            strokeUnionDirty = nil
+        }
+        activeBrushSize = max(1.0, brushSize)
+        activeMode = mode
+        if let tip = ImageEraser.makeBrushTipImage(brushSize: activeBrushSize, hardness: hardness) {
+            activeBrushTip = tip.image
+            activeBrushTipSize = tip.size
+        } else {
+            activeBrushTip = nil
+            activeBrushTipSize = 0.0
+        }
+        rawPoints.removeAll(keepingCapacity: true)
+        lastMidpoint = nil
+        isStrokeActive = true
+    }
+
+    /// Appends a pointer position in mask pixel coordinates, updating ONLY the newly affected dirty rect.
+    @discardableResult
+    public func appendPoint(_ point: CGPoint) -> PixelDirtyRect? {
+        guard isStrokeActive else { return nil }
+        if let last = rawPoints.last, hypot(point.x - last.x, point.y - last.y) < 0.25 {
+            return nil
+        }
+        rawPoints.append(point)
+        let count = rawPoints.count
+
+        let dirty: PixelDirtyRect?
+        if count == 1 {
+            dirty = stampSegmentCoverage(from: point, to: point)
+        } else if count == 2 {
+            let p0 = rawPoints[0]
+            let p1 = rawPoints[1]
+            let mid = CGPoint(x: (p0.x + p1.x) * 0.5, y: (p0.y + p1.y) * 0.5)
+            lastMidpoint = mid
+            dirty = stampSegmentCoverage(from: p0, to: mid)
+        } else {
+            let ctrl = rawPoints[count - 2]
+            let next = rawPoints[count - 1]
+            let start = lastMidpoint ?? rawPoints[count - 3]
+            let mid = CGPoint(x: (ctrl.x + next.x) * 0.5, y: (ctrl.y + next.y) * 0.5)
+            lastMidpoint = mid
+            dirty = stampQuadraticCurveCoverage(from: start, control: ctrl, to: mid)
+        }
+
+        if let dirty {
+            combineDirtyRect(dirty)
+        }
+        return dirty
+    }
+
+    /// Finishes the trailing half-segment of the active stroke and returns its dirty rect.
+    @discardableResult
+    public func finishStroke() -> PixelDirtyRect? {
+        guard isStrokeActive else { return nil }
+        isStrokeActive = false
+        var trailingDirty: PixelDirtyRect? = nil
+        if let start = lastMidpoint, let last = rawPoints.last {
+            trailingDirty = stampSegmentCoverage(from: start, to: last)
+            if let trailingDirty {
+                combineDirtyRect(trailingDirty)
+            }
+        }
+        return trailingDirty
+    }
+
+    /// Composites ONLY `rect` by multiplying `baseRGBA` (premultiplied RGBA8) by this mask into `destRGBA`.
+    public func compositeDirtyRect(
+        _ rect: PixelDirtyRect,
+        baseRGBA: [UInt8],
+        into destRGBA: inout [UInt8]
+    ) {
+        let clampedMinX = max(0, rect.minX)
+        let clampedMaxX = min(width - 1, rect.maxX)
+        let clampedMinY = max(0, rect.minY)
+        let clampedMaxY = min(height - 1, rect.maxY)
+        guard clampedMinX <= clampedMaxX, clampedMinY <= clampedMaxY else { return }
+
+        destRGBA.withUnsafeMutableBufferPointer { dstBuf in
+            baseRGBA.withUnsafeBufferPointer { srcBuf in
+                workingMaskBytes.withUnsafeBufferPointer { maskBuf in
+                    guard let dst = dstBuf.baseAddress,
+                          let src = srcBuf.baseAddress,
+                          let mask = maskBuf.baseAddress else { return }
+                    for y in clampedMinY...clampedMaxY {
+                        let rowMask = y * width
+                        for x in clampedMinX...clampedMaxX {
+                            let idx = rowMask + x
+                            let m = Int(mask[idx])
+                            let px = idx * 4
+                            if m == 255 {
+                                dst[px]     = src[px]
+                                dst[px + 1] = src[px + 1]
+                                dst[px + 2] = src[px + 2]
+                                dst[px + 3] = src[px + 3]
+                            } else if m == 0 {
+                                dst[px]     = 0
+                                dst[px + 1] = 0
+                                dst[px + 2] = 0
+                                dst[px + 3] = 0
+                            } else {
+                                dst[px]     = UInt8((Int(src[px]) * m + 127) / 255)
+                                dst[px + 1] = UInt8((Int(src[px + 1]) * m + 127) / 255)
+                                dst[px + 2] = UInt8((Int(src[px + 2]) * m + 127) / 255)
+                                dst[px + 3] = UInt8((Int(src[px + 3]) * m + 127) / 255)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Composites the entire mask against `baseRGBA` into `destRGBA` (used once at preview initialization).
+    public func compositeAll(baseRGBA: [UInt8], into destRGBA: inout [UInt8]) {
+        compositeDirtyRect(
+            PixelDirtyRect(minX: 0, maxX: width - 1, minY: 0, maxY: height - 1),
+            baseRGBA: baseRGBA,
+            into: &destRGBA
+        )
+    }
+
+    /// Builds an immutable 8-bit grayscale `CGImage` from the current working mask buffer.
+    public func makeMaskImage() throws -> CGImage {
+        try ImageEraser.makeGrayscaleMaskImage(bytes: workingMaskBytes, width: width, height: height)
+    }
+
+    private func clearCoverageAndSyncBase(in rect: PixelDirtyRect) {
+        let minX = max(0, rect.minX)
+        let maxX = min(width - 1, rect.maxX)
+        let minY = max(0, rect.minY)
+        let maxY = min(height - 1, rect.maxY)
+        guard minX <= maxX, minY <= maxY else { return }
+        let span = maxX - minX + 1
+        let cov = coveragePointer
+
+        strokeBaseBytes.withUnsafeMutableBufferPointer { baseBuf in
+            workingMaskBytes.withUnsafeBufferPointer { workBuf in
+                guard let base = baseBuf.baseAddress,
+                      let work = workBuf.baseAddress else { return }
+                for y in minY...maxY {
+                    let offset = y * width + minX
+                    memset(cov + offset, 0, span)
+                    memcpy(base + offset, work + offset, span)
+                }
+            }
+        }
+    }
+
+    private func stampSegmentCoverage(from a: CGPoint, to b: CGPoint) -> PixelDirtyRect? {
+        guard let tip = activeBrushTip else { return nil }
+        let half = activeBrushTipSize * 0.5
+        let dist = hypot(b.x - a.x, b.y - a.y)
+        let spacing = max(1.0, min(activeBrushSize * 0.12, 4.0))
+        let steps = dist < 1e-4 ? 0 : max(1, Int(ceil(dist / spacing)))
+
+        if steps == 0 {
+            let rect = CGRect(x: a.x - half, y: a.y - half, width: activeBrushTipSize, height: activeBrushTipSize)
+            coverageContext.draw(tip, in: rect)
+        } else {
+            for s in 0...steps {
+                let t = CGFloat(s) / CGFloat(steps)
+                let px = a.x + (b.x - a.x) * t
+                let py = a.y + (b.y - a.y) * t
+                let rect = CGRect(x: px - half, y: py - half, width: activeBrushTipSize, height: activeBrushTipSize)
+                coverageContext.draw(tip, in: rect)
+            }
+        }
+
+        let pad = half + 1.0
+        let minX = max(0, Int(floor(min(a.x, b.x) - pad)))
+        let maxX = min(width - 1, Int(ceil(max(a.x, b.x) + pad)))
+        let minY = max(0, Int(floor(min(a.y, b.y) - pad)))
+        let maxY = min(height - 1, Int(ceil(max(a.y, b.y) + pad)))
+        guard minX <= maxX, minY <= maxY else { return nil }
+        return PixelDirtyRect(minX: minX, maxX: maxX, minY: minY, maxY: maxY)
+    }
+
+    private func stampQuadraticCurveCoverage(from p0: CGPoint, control p1: CGPoint, to p2: CGPoint) -> PixelDirtyRect? {
+        guard let tip = activeBrushTip else { return nil }
+        let half = activeBrushTipSize * 0.5
+        let approxLen = hypot(p1.x - p0.x, p1.y - p0.y) + hypot(p2.x - p1.x, p2.y - p1.y)
+        let spacing = max(1.0, min(activeBrushSize * 0.12, 4.0))
+        let steps = max(1, Int(ceil(approxLen / spacing)))
+
+        var minPx = p0.x, maxPx = p0.x
+        var minPy = p0.y, maxPy = p0.y
+        for s in 1...steps {
+            let t = CGFloat(s) / CGFloat(steps)
+            let mt = 1.0 - t
+            let px = mt * mt * p0.x + 2.0 * mt * t * p1.x + t * t * p2.x
+            let py = mt * mt * p0.y + 2.0 * mt * t * p1.y + t * t * p2.y
+            if px < minPx { minPx = px }
+            if px > maxPx { maxPx = px }
+            if py < minPy { minPy = py }
+            if py > maxPy { maxPy = py }
+            let rect = CGRect(x: px - half, y: py - half, width: activeBrushTipSize, height: activeBrushTipSize)
+            coverageContext.draw(tip, in: rect)
+        }
+
+        let pad = half + 1.0
+        let minX = max(0, Int(floor(minPx - pad)))
+        let maxX = min(width - 1, Int(ceil(maxPx + pad)))
+        let minY = max(0, Int(floor(minPy - pad)))
+        let maxY = min(height - 1, Int(ceil(maxPy + pad)))
+        guard minX <= maxX, minY <= maxY else { return nil }
+        return PixelDirtyRect(minX: minX, maxX: maxX, minY: minY, maxY: maxY)
+    }
+
+    private func combineDirtyRect(_ rect: PixelDirtyRect) {
+        let covPtr = coveragePointer
+        strokeBaseBytes.withUnsafeBufferPointer { baseBuf in
+            workingMaskBytes.withUnsafeMutableBufferPointer { workBuf in
+                guard let basePtr = baseBuf.baseAddress,
+                      let workPtr = workBuf.baseAddress else { return }
+                ImageEraser.combineMaskDirtyRectVImage(
+                    base: basePtr,
+                    coverage: covPtr,
+                    mode: activeMode,
+                    width: width,
+                    rect: (rect.minX, rect.maxX, rect.minY, rect.maxY),
+                    zeroScratch: &zeroScratch,
+                    into: workPtr
+                )
+            }
+        }
+        strokeUnionDirty = strokeUnionDirty?.union(rect) ?? rect
+    }
+}
+
 // MARK: - Incremental Interactive Stroke Session
 
 /// Incremental rasterizer for a single live drag stroke on an image layer's alpha mask.
@@ -621,12 +1266,7 @@ public struct EraserStrokeSession: Sendable {
     public let hardness: CGFloat
     public let mode: EraserMode
 
-    private let metrics: ImageEraser.BrushMetrics
-    private let baseMaskBytes: [UInt8]
-    private var coverageBytes: [UInt8]
-    private var workingMaskBytes: [UInt8]
-    private var rawPoints: [CGPoint] = []
-    private var lastMidpoint: CGPoint?
+    private let mask: PersistentAlphaMask
     private var didFinish: Bool = false
 
     public init(
@@ -648,94 +1288,44 @@ public struct EraserStrokeSession: Sendable {
         self.brushSize = brushSize
         self.hardness = hardness
         self.mode = mode
-        self.metrics = ImageEraser.BrushMetrics(brushSize: brushSize, hardness: hardness)
+        let persistent = try PersistentAlphaMask(baseMask: baseMask, width: width, height: height)
+        persistent.beginStroke(brushSize: brushSize, hardness: hardness, mode: mode)
+        self.mask = persistent
+    }
 
-        let base = try ImageEraser.readGrayscaleMaskBytes(baseMask, width: width, height: height)
-        self.baseMaskBytes = base
-        self.coverageBytes = [UInt8](repeating: 0, count: width * height)
-        self.workingMaskBytes = base
+    /// Appends a pointer position in top-left image pixel coordinates without allocating a `CGImage`,
+    /// returning only the affected dirty pixel rect.
+    @discardableResult
+    public mutating func appendPointDirtyRect(_ point: CGPoint) -> PixelDirtyRect? {
+        mask.appendPoint(point)
+    }
+
+    /// Completes the trailing half-segment of the stroke without allocating a `CGImage`,
+    /// returning only the affected dirty pixel rect.
+    @discardableResult
+    public mutating func finishDirtyRect() -> PixelDirtyRect? {
+        guard !didFinish else { return nil }
+        didFinish = true
+        return mask.finishStroke()
     }
 
     /// Appends a pointer position in top-left image pixel coordinates and returns the updated alpha mask `CGImage`.
     @discardableResult
     public mutating func appendPoint(_ point: CGPoint) throws -> CGImage {
-        if let last = rawPoints.last, hypot(point.x - last.x, point.y - last.y) < 0.25 {
-            return try currentMaskImage()
-        }
-        rawPoints.append(point)
-        let count = rawPoints.count
-
-        if count == 1 {
-            stampAndUpdate(from: point, to: point)
-        } else if count == 2 {
-            let p0 = rawPoints[0]
-            let p1 = rawPoints[1]
-            let mid = CGPoint(x: (p0.x + p1.x) * 0.5, y: (p0.y + p1.y) * 0.5)
-            stampAndUpdate(from: p0, to: mid)
-            lastMidpoint = mid
-        } else {
-            let ctrl = rawPoints[count - 2]
-            let next = rawPoints[count - 1]
-            let start = lastMidpoint ?? rawPoints[count - 3]
-            let mid = CGPoint(x: (ctrl.x + next.x) * 0.5, y: (ctrl.y + next.y) * 0.5)
-            stampQuadraticCurve(from: start, control: ctrl, to: mid)
-            lastMidpoint = mid
-        }
-
+        _ = mask.appendPoint(point)
         return try currentMaskImage()
     }
 
     /// Completes the trailing half-segment of the stroke and returns the final alpha mask `CGImage`.
     @discardableResult
     public mutating func finish() throws -> CGImage {
-        guard !didFinish else { return try currentMaskImage() }
-        didFinish = true
-        if let start = lastMidpoint, let last = rawPoints.last {
-            stampAndUpdate(from: start, to: last)
-        }
+        _ = finishDirtyRect()
         return try currentMaskImage()
     }
 
     /// Builds an immutable grayscale mask `CGImage` from the current stroke buffer.
     public func currentMaskImage() throws -> CGImage {
-        try ImageEraser.makeGrayscaleMaskImage(bytes: workingMaskBytes, width: width, height: height)
-    }
-
-    private mutating func stampQuadraticCurve(from p0: CGPoint, control p1: CGPoint, to p2: CGPoint) {
-        let approxLen = hypot(p1.x - p0.x, p1.y - p0.y) + hypot(p2.x - p1.x, p2.y - p1.y)
-        let step = max(1.0, min(brushSize * 0.25, 4.0))
-        let steps = max(1, Int(ceil(approxLen / step)))
-        var prev = p0
-        for s in 1...steps {
-            let t = CGFloat(s) / CGFloat(steps)
-            let mt = 1.0 - t
-            let curr = CGPoint(
-                x: mt * mt * p0.x + 2.0 * mt * t * p1.x + t * t * p2.x,
-                y: mt * mt * p0.y + 2.0 * mt * t * p1.y + t * t * p2.y
-            )
-            stampAndUpdate(from: prev, to: curr)
-            prev = curr
-        }
-    }
-
-    private mutating func stampAndUpdate(from a: CGPoint, to b: CGPoint) {
-        guard let dirty = ImageEraser.stampCapsule(
-            from: a,
-            to: b,
-            metrics: metrics,
-            width: width,
-            height: height,
-            coverage: &coverageBytes
-        ) else { return }
-
-        ImageEraser.combineMaskDirtyRect(
-            base: baseMaskBytes,
-            coverage: coverageBytes,
-            mode: mode,
-            width: width,
-            rect: dirty,
-            into: &workingMaskBytes
-        )
+        try mask.makeMaskImage()
     }
 }
 
@@ -762,11 +1352,20 @@ extension SendableImage {
 
     /// Returns a new `SendableImage` with a sequence of eraser/restore strokes applied to its `alphaMask`.
     public func applyingEraserStrokes(_ strokes: [EraserStroke]) throws -> SendableImage {
-        var current = self
-        for stroke in strokes {
-            current = try current.applyingEraserStroke(stroke)
-        }
-        return current
+        guard !strokes.isEmpty else { return self }
+        let updatedMask = try ImageEraser.applyStrokesToMask(
+            alphaMask,
+            width: width,
+            height: height,
+            strokes: strokes
+        )
+        return SendableImage(
+            cgImage,
+            filterPreset: filterPreset,
+            adjustments: adjustments,
+            frame: frame,
+            alphaMask: updatedMask
+        )
     }
 
     /// Returns `cgImage` composited with `alphaMask`, or `cgImage` directly when `alphaMask == nil`.

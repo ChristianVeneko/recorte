@@ -45,7 +45,7 @@ struct GlassDocumentTrayView: View {
         return VStack(spacing: 3) {
             ZStack(alignment: .topTrailing) {
                 Group {
-                    if let cgImage = editor.renderedImage {
+                    if let cgImage = editor.trayThumbnail {
                         Image(decorative: cgImage, scale: 1.0)
                             .resizable()
                             .scaledToFill()
@@ -91,7 +91,7 @@ struct GlassDocumentTrayView: View {
         }
         .draggable(TrayDocumentTransfer(editorID: editor.id)) {
             Group {
-                if let cgImage = editor.renderedImage {
+                if let cgImage = editor.trayThumbnail {
                     Image(decorative: cgImage, scale: 1.0)
                         .resizable()
                         .scaledToFit()

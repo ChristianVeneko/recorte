@@ -1,7 +1,33 @@
 import AppKit
+import CoreTransferable
 import RecorteCore
 import RecorteIO
 import SwiftUI
+import UniformTypeIdentifiers
+
+/// Renders the full-res composite lazily only when the user actually triggers Share,
+/// avoiding full-res renders and full-res CoreAnimation SharePreview uploads on every toolbar update.
+private struct LazyEditorShareItem: Transferable, Sendable {
+    let editorID: UUID
+    let title: String
+
+    static var transferRepresentation: some TransferRepresentation {
+        DataRepresentation(exportedContentType: .png) { item in
+            let image: CGImage? = await MainActor.run {
+                Workspace.shared.editor(id: item.editorID)?.renderComposite()
+            }
+            guard let image else {
+                throw ImageExportError.encodingFailed
+            }
+            return try ImageExporter.encode(image, format: .png)
+        }
+        .suggestedFileName { item in
+            let trimmed = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            let base = trimmed.isEmpty ? "Recorte" : trimmed
+            return base.hasSuffix(".png") ? base : "\(base).png"
+        }
+    }
+}
 
 struct EditorWindowView: View {
     let requestedEditorID: UUID?
@@ -121,10 +147,10 @@ struct EditorWindowView: View {
             }
 
             ToolbarItemGroup(placement: .primaryAction) {
-                if let shareItem = model.shareableImage() {
+                if model.hasCanvasSurface {
                     ShareLink(
-                        item: shareItem,
-                        preview: SharePreview(model.title, image: Image(decorative: shareItem.image, scale: 1.0))
+                        item: LazyEditorShareItem(editorID: model.id, title: model.title),
+                        preview: SharePreview(model.title, image: Image(systemName: "photo"))
                     ) {
                         Label("Share", systemImage: "square.and.arrow.up")
                     }

@@ -14,6 +14,12 @@ public final class EditorModel: Identifiable {
     public var document: EditorDocument
     public var activeTool: EditorTool = .move {
         didSet {
+            if activeTool != oldValue {
+                liveTransformPreview = nil
+                if oldValue == .eraser {
+                    flushPendingEraserCommitSynchronously()
+                }
+            }
             if activeTool == .crop {
                 if cropSpec == nil {
                     initializeCropSpec()
@@ -36,12 +42,23 @@ public final class EditorModel: Identifiable {
         }
     }
     public var cropSpec: CropSpec?
+    /// The currently rendered canvas image for display (downsampled to view pixel size when attached
+    /// to a window, or full 1.0 document resolution in headless/test contexts).
     public var renderedImage: CGImage?
+    /// Compact 160 px thumbnail of the rendered document for the bottom tray and previews (S28).
+    public private(set) var trayThumbnail: CGImage?
+    /// Current preview render scale (`<= 1.0`) matching the attached canvas view's pixel size.
+    public private(set) var previewRenderScale: CGFloat = 1.0
     public var isRemovingBackground: Bool = false
     public var lastErrorMessage: String?
     public var statusMessage: String?
     public var projectURL: URL?
-    public var undoManager: UndoManager
+    public static let maxUndoLevels: Int = 12
+    public var undoManager: UndoManager {
+        didSet {
+            configureUndoManager(undoManager)
+        }
+    }
 
     // Sheet presentation triggers (for menus)
     public var isPresentingResizeSheet: Bool = false
@@ -91,6 +108,10 @@ public final class EditorModel: Identifiable {
     public var toneCurve: ToneCurveSpec = ToneCurveSpec()
 
     private var continuousEditStartDocument: EditorDocument?
+    private var continuousEditStartTitle: String?
+    private var previewTargetPixelSize: CGSize?
+    private var lastRenderedScale: CGFloat = 1.0
+    private var recentHeavyUndoBoxes: [WeakCompactImageBox] = []
 
     public struct LiveTransformPreview: Sendable {
         public let layerID: UUID
@@ -111,8 +132,15 @@ public final class EditorModel: Identifiable {
         self.title = title
         self.document = document
         self.undoManager = undoManager
+        configureUndoManager(undoManager)
         if !document.layers.isEmpty || document.background != .transparent {
             rerender()
+        }
+    }
+
+    private func configureUndoManager(_ manager: UndoManager) {
+        if manager.levelsOfUndo == 0 || manager.levelsOfUndo > Self.maxUndoLevels {
+            manager.levelsOfUndo = Self.maxUndoLevels
         }
     }
 
@@ -146,21 +174,23 @@ public final class EditorModel: Identifiable {
         targetImageLayer() != nil
     }
 
-    // MARK: - Undo / Redo
+    // MARK: - Undo / Redo (Diff-Based & Capped for S28 Memory)
 
     public func undo() {
+        flushPendingEraserCommitSynchronously()
         undoManager.undo()
     }
 
     public func redo() {
+        flushPendingEraserCommitSynchronously()
         undoManager.redo()
     }
 
-    private func registerUndoSnapshot(
-        previousDoc: EditorDocument,
-        previousTitle: String,
-        actionName: String
+    internal func registerUndoAction(
+        actionName: String,
+        _ handler: @escaping @MainActor (EditorModel) -> Void
     ) {
+        configureUndoManager(undoManager)
         let shouldManageGroup = !undoManager.isUndoing && !undoManager.isRedoing && undoManager.groupingLevel == 0
         let previousGroupsByEvent = undoManager.groupsByEvent
         if shouldManageGroup {
@@ -169,11 +199,7 @@ public final class EditorModel: Identifiable {
         }
         undoManager.registerUndo(withTarget: self) { target in
             MainActor.assumeIsolated {
-                target.applyDocumentSnapshot(
-                    previousDoc,
-                    titleSnapshot: previousTitle,
-                    actionName: actionName
-                )
+                handler(target)
             }
         }
         undoManager.setActionName(actionName)
@@ -183,34 +209,79 @@ public final class EditorModel: Identifiable {
         }
     }
 
-    private func applyDocumentSnapshot(
-        _ snapshot: EditorDocument,
-        titleSnapshot: String,
+    private func registerUndoSnapshot(
+        previousDoc: EditorDocument,
+        previousTitle: String,
         actionName: String
     ) {
-        let previousDoc = document
-        let previousTitle = title
-        liveTransformPreview = nil
-        document = snapshot
-        title = titleSnapshot
-        if activeTool == .crop {
-            cropSpec = nil
-            activeTool = .move
-        }
-        if activeTool == .perspective {
-            perspectiveQuad = nil
-            activeTool = .move
-        }
-        rerender()
-
-        registerUndoSnapshot(
-            previousDoc: previousDoc,
+        let delta = UndoDocumentDelta.make(
+            from: previousDoc,
             previousTitle: previousTitle,
-            actionName: actionName
+            to: document,
+            currentTitle: title
         )
+        registerUndoDelta(delta, actionName: actionName)
+    }
+
+    private func registerUndoDelta(_ delta: UndoDocumentDelta, actionName: String) {
+        trackAndCompactHeavyUndoBoxes(delta.heavyBoxes)
+        registerUndoAction(actionName: actionName) { target in
+            target.applyUndoDelta(delta, actionName: actionName)
+        }
+    }
+
+    /// Keeps the 2 most recent heavy bitmap undo boxes uncompressed for instant Cmd+Z and pointer identity,
+    /// while LZFSE-compressing older heavy bitmap boxes to bound undo memory (S28).
+    private func trackAndCompactHeavyUndoBoxes(_ newBoxes: [CompactCGImageBox]) {
+        guard !newBoxes.isEmpty else { return }
+        recentHeavyUndoBoxes.removeAll { $0.box == nil }
+        for box in newBoxes {
+            recentHeavyUndoBoxes.append(WeakCompactImageBox(box))
+        }
+        let maxUncompressedBoxes = 2
+        if recentHeavyUndoBoxes.count > maxUncompressedBoxes {
+            let overflow = recentHeavyUndoBoxes.count - maxUncompressedBoxes
+            for i in 0..<overflow {
+                recentHeavyUndoBoxes[i].box?.compressIfLarge()
+            }
+            recentHeavyUndoBoxes.removeFirst(overflow)
+        }
+    }
+
+    private func applyUndoDelta(_ delta: UndoDocumentDelta, actionName: String) {
+        autoreleasepool {
+            let currentDocBeforeUndo = document
+            let currentTitleBeforeUndo = title
+            liveTransformPreview = nil
+            continuousEditStartDocument = nil
+            continuousEditStartTitle = nil
+
+            let inverse = delta.apply(to: &document, title: &title)
+
+            if activeTool == .crop {
+                cropSpec = nil
+                activeTool = .move
+            }
+            if activeTool == .perspective {
+                perspectiveQuad = nil
+                activeTool = .move
+            }
+            rerender()
+
+            if let inverse {
+                registerUndoDelta(inverse, actionName: actionName)
+            } else {
+                registerUndoSnapshot(
+                    previousDoc: currentDocBeforeUndo,
+                    previousTitle: currentTitleBeforeUndo,
+                    actionName: actionName
+                )
+            }
+        }
     }
 
     private func commitMutation(actionName: String, _ mutation: (inout EditorDocument) -> Void) {
+        flushPendingEraserCommitSynchronously()
         let previousDoc = document
         let previousTitle = title
         var nextDoc = document
@@ -228,19 +299,23 @@ public final class EditorModel: Identifiable {
     }
 
     public func beginContinuousEdit() {
+        flushPendingEraserCommitSynchronously()
         if continuousEditStartDocument == nil {
             continuousEditStartDocument = document
+            continuousEditStartTitle = title
         }
     }
 
     public func endContinuousEdit(actionName: String) {
         guard let startDoc = continuousEditStartDocument else { return }
+        let startTitle = continuousEditStartTitle ?? title
         continuousEditStartDocument = nil
+        continuousEditStartTitle = nil
         guard startDoc != document else { return }
 
         registerUndoSnapshot(
             previousDoc: startDoc,
-            previousTitle: title,
+            previousTitle: startTitle,
             actionName: actionName
         )
     }
@@ -276,7 +351,8 @@ public final class EditorModel: Identifiable {
         beginContinuousEdit()
         guard let split = DocumentRenderer.renderLiveTransformSplit(
             document,
-            activeLayerID: layerID
+            activeLayerID: layerID,
+            scale: previewRenderScale
         ) else { return }
 
         liveTransformPreview = LiveTransformPreview(
@@ -347,32 +423,85 @@ public final class EditorModel: Identifiable {
         }
     }
 
-    // MARK: - Rendering
+    // MARK: - Rendering (Preview-Downsampled On-Screen, Full-Res On-Demand for Export)
+
+    /// Updates the target pixel size of the on-screen canvas view so `rerender()` downsamples
+    /// previews to view pixel size instead of allocating full-resolution textures (S28).
+    public func updatePreviewTargetPixelSize(_ pixelSize: CGSize) {
+        guard pixelSize.width >= 16, pixelSize.height >= 16 else { return }
+        previewTargetPixelSize = pixelSize
+        let desired = computeDesiredPreviewScale()
+        guard hasCanvasSurface else {
+            previewRenderScale = desired
+            return
+        }
+        guard liveTransformPreview == nil, !isEraserStrokeActive else {
+            previewRenderScale = desired
+            return
+        }
+        let relativeChange = abs(desired - previewRenderScale) / max(previewRenderScale, 0.01)
+        if renderedImage == nil || relativeChange > 0.12 {
+            previewRenderScale = desired
+            rerender()
+        }
+    }
+
+    private func computeDesiredPreviewScale() -> CGFloat {
+        guard let target = previewTargetPixelSize,
+              document.canvasSize.width >= 1,
+              document.canvasSize.height >= 1 else {
+            return 1.0
+        }
+        let scaleX = target.width / document.canvasSize.width
+        let scaleY = target.height / document.canvasSize.height
+        let raw = max(scaleX, scaleY)
+        return min(1.0, max(0.1, raw))
+    }
 
     public func rerender() {
         guard document.canvasSize.width >= 1, document.canvasSize.height >= 1 else {
             renderedImage = nil
+            trayThumbnail = nil
             return
         }
         if document.layers.isEmpty && document.background == .transparent {
             renderedImage = nil
+            trayThumbnail = nil
             return
         }
-        renderedImage = try? DocumentRenderer.render(document, scale: 1.0)
+        let scale = computeDesiredPreviewScale()
+        previewRenderScale = scale
+        let image = try? DocumentRenderer.render(document, scale: scale)
+        applyRenderedPreview(image, scale: scale)
+    }
+
+    /// Installs a pre-rendered preview image (e.g. produced off the main thread after an eraser stroke).
+    internal func applyRenderedPreview(_ image: CGImage?, scale: CGFloat) {
+        renderedImage = image
+        lastRenderedScale = scale
+        if let image {
+            trayThumbnail = ImageFilters.downsample(image, maxDimension: ImageThumbnailCache.defaultMaxDimension) ?? image
+        } else {
+            trayThumbnail = nil
+        }
         renderCount += 1
     }
 
+    /// Returns a full-resolution (`scale == 1.0`) composite of the current document for export,
+    /// clipboard copy, crop, resize, or tray transfer. Renders on-demand when the on-screen preview is downsampled.
     public func renderComposite() -> CGImage? {
-        if let renderedImage {
+        flushPendingEraserCommitSynchronously()
+        guard hasCanvasSurface else { return nil }
+        if let renderedImage, lastRenderedScale >= 0.999 {
             return renderedImage
         }
-        rerender()
-        return renderedImage
+        return try? DocumentRenderer.render(document, scale: 1.0)
     }
 
     // MARK: - S13: .recorte Projects, PDF Export, Save to Downloads
 
     public func saveProject(to url: URL) throws {
+        flushPendingEraserCommitSynchronously()
         let packageURL = url.pathExtension.lowercased() == RecorteProject.fileExtension
             ? url
             : url.appendingPathExtension(RecorteProject.fileExtension)
@@ -386,6 +515,7 @@ public final class EditorModel: Identifiable {
     }
 
     public func loadProject(from url: URL) throws {
+        flushPendingEraserCommitSynchronously()
         let loadedDocument = try RecorteProject.load(from: url)
         let previousDoc = document
         let previousTitle = title
@@ -410,6 +540,7 @@ public final class EditorModel: Identifiable {
     }
 
     public func exportPDF(to url: URL) throws {
+        flushPendingEraserCommitSynchronously()
         guard hasCanvasSurface else {
             throw RecorteProjectError.pdfCreationFailed
         }
@@ -1561,6 +1692,564 @@ public final class EditorModel: Identifiable {
             return "paintbrush.pointed"
         default:
             return "square.stack.3d.up"
+        }
+    }
+}
+
+// MARK: - Compact Diff-Based Undo Payloads (S28 Memory)
+
+private final class WeakCompactImageBox {
+    weak var box: CompactCGImageBox?
+    init(_ box: CompactCGImageBox) {
+        self.box = box
+    }
+}
+
+/// Holds a `CGImage` for undo history; starts uncompressed for instant recent undo and identity
+/// preservation, then losslessly LZFSE-compresses large raw pixel buffers (`>= 1 MB`) once aged
+/// past the most recent entries so destructive bitmap edits stay lean in RAM.
+private final class CompactCGImageBox: @unchecked Sendable {
+    private enum Storage {
+        case direct(CGImage)
+        case compressed(
+            data: Data,
+            width: Int,
+            height: Int,
+            bitsPerComponent: Int,
+            bitsPerPixel: Int,
+            bytesPerRow: Int,
+            colorSpace: CGColorSpace,
+            bitmapInfo: CGBitmapInfo,
+            shouldInterpolate: Bool,
+            intent: CGColorRenderingIntent
+        )
+    }
+
+    private var storage: Storage
+    private static let compressionThresholdBytes = 1_048_576
+
+    init(_ image: CGImage) {
+        self.storage = .direct(image)
+    }
+
+    func compressIfLarge() {
+        autoreleasepool {
+            guard case .direct(let image) = storage else { return }
+            if let cfData = image.dataProvider?.data {
+                let rawData = cfData as Data
+                if rawData.count >= Self.compressionThresholdBytes,
+                   let cs = image.colorSpace,
+                   let compressed = try? (rawData as NSData).compressed(using: .lzfse) as Data,
+                   compressed.count < (rawData.count * 8) / 10 {
+                    self.storage = .compressed(
+                        data: compressed,
+                        width: image.width,
+                        height: image.height,
+                        bitsPerComponent: image.bitsPerComponent,
+                        bitsPerPixel: image.bitsPerPixel,
+                        bytesPerRow: image.bytesPerRow,
+                        colorSpace: cs,
+                        bitmapInfo: image.bitmapInfo,
+                        shouldInterpolate: image.shouldInterpolate,
+                        intent: image.renderingIntent
+                    )
+                }
+            }
+        }
+    }
+
+    func restore() -> CGImage? {
+        autoreleasepool {
+            switch storage {
+            case .direct(let img):
+                return img
+            case .compressed(
+                let data,
+                let width,
+                let height,
+                let bpc,
+                let bpp,
+                let bpr,
+                let cs,
+                let bitmapInfo,
+                let shouldInterpolate,
+                let intent
+            ):
+                guard let decompressed = try? (data as NSData).decompressed(using: .lzfse) as Data,
+                      let provider = CGDataProvider(data: decompressed as CFData) else {
+                    return nil
+                }
+                return CGImage(
+                    width: width,
+                    height: height,
+                    bitsPerComponent: bpc,
+                    bitsPerPixel: bpp,
+                    bytesPerRow: bpr,
+                    space: cs,
+                    bitmapInfo: bitmapInfo,
+                    provider: provider,
+                    decode: nil,
+                    shouldInterpolate: shouldInterpolate,
+                    intent: intent
+                )
+            }
+        }
+    }
+}
+
+private struct CompactLayerSnapshot: @unchecked Sendable {
+    private enum KindPayload {
+        case image(
+            cgImage: CompactCGImageBox,
+            filterPreset: FilterPreset,
+            adjustments: Adjustments,
+            frame: ImageFrame,
+            alphaMask: CompactCGImageBox?
+        )
+        case other(LayerKind)
+    }
+
+    let id: UUID
+    let name: String
+    let transform: LayerTransform
+    let opacity: Double
+    let isHidden: Bool
+    let isLocked: Bool
+    private let kindPayload: KindPayload
+
+    var heavyBoxes: [CompactCGImageBox] {
+        switch kindPayload {
+        case .image(let cgBox, _, _, _, let maskBox):
+            if let maskBox {
+                return [cgBox, maskBox]
+            }
+            return [cgBox]
+        case .other:
+            return []
+        }
+    }
+
+    init(_ layer: Layer) {
+        self.id = layer.id
+        self.name = layer.name
+        self.transform = layer.transform
+        self.opacity = layer.opacity
+        self.isHidden = layer.isHidden
+        self.isLocked = layer.isLocked
+        switch layer.kind {
+        case .image(let img):
+            self.kindPayload = .image(
+                cgImage: CompactCGImageBox(img.cgImage),
+                filterPreset: img.filterPreset,
+                adjustments: img.adjustments,
+                frame: img.frame,
+                alphaMask: img.alphaMask.map { CompactCGImageBox($0) }
+            )
+        default:
+            self.kindPayload = .other(layer.kind)
+        }
+    }
+
+    func restore() -> Layer? {
+        let kind: LayerKind
+        switch kindPayload {
+        case .image(let compactCG, let preset, let adj, let frame, let compactMask):
+            guard let cg = compactCG.restore() else { return nil }
+            let mask = compactMask?.restore()
+            kind = .image(SendableImage(cg, filterPreset: preset, adjustments: adj, frame: frame, alphaMask: mask))
+        case .other(let k):
+            kind = k
+        }
+        return Layer(
+            id: id,
+            name: name,
+            kind: kind,
+            transform: transform,
+            opacity: opacity,
+            isHidden: isHidden,
+            isLocked: isLocked
+        )
+    }
+}
+
+private struct CompactDocumentSnapshot: @unchecked Sendable {
+    let canvasSize: CGSize
+    let background: CanvasBackground
+    let layers: [CompactLayerSnapshot]
+    let selection: UUID?
+    let title: String
+
+    var heavyBoxes: [CompactCGImageBox] {
+        layers.flatMap(\.heavyBoxes)
+    }
+
+    init(document: EditorDocument, title: String) {
+        self.canvasSize = document.canvasSize
+        self.background = document.background
+        self.layers = document.layers.map { CompactLayerSnapshot($0) }
+        self.selection = document.selection
+        self.title = title
+    }
+
+    func restore() -> (document: EditorDocument, title: String)? {
+        var restoredLayers: [Layer] = []
+        restoredLayers.reserveCapacity(layers.count)
+        for compact in layers {
+            guard let layer = compact.restore() else { return nil }
+            restoredLayers.append(layer)
+        }
+        return (
+            EditorDocument(
+                canvasSize: canvasSize,
+                background: background,
+                layers: restoredLayers,
+                selection: selection
+            ),
+            title
+        )
+    }
+}
+
+private struct ImageStyleDelta: Sendable {
+    let filterPreset: FilterPreset
+    let adjustments: Adjustments
+    let frame: ImageFrame
+}
+
+/// Minimal per-operation undo delta so metadata, transform, filter, reorder, and layer insertion edits
+/// never retain full-document `CGImage` snapshots on the undo stack.
+private enum UndoDocumentDelta {
+    case background(previous: CanvasBackground, previousTitle: String)
+    case reorder(previousOrder: [UUID], previousSelection: UUID?, previousTitle: String)
+    case layerMetadata(
+        id: UUID,
+        name: String,
+        transform: LayerTransform,
+        opacity: Double,
+        isHidden: Bool,
+        isLocked: Bool,
+        imageStyle: ImageStyleDelta?,
+        nonImageKind: LayerKind?,
+        previousSelection: UUID?,
+        previousTitle: String
+    )
+    case layerInserted(
+        insertedID: UUID,
+        previousSelection: UUID?,
+        previousCanvasSize: CGSize,
+        previousBackground: CanvasBackground,
+        previousTitle: String
+    )
+    case layerRemoved(
+        removedLayer: CompactLayerSnapshot,
+        index: Int,
+        previousSelection: UUID?,
+        previousCanvasSize: CGSize,
+        previousBackground: CanvasBackground,
+        previousTitle: String
+    )
+    case layerPixelsReplaced(
+        previousLayer: CompactLayerSnapshot,
+        previousSelection: UUID?,
+        previousCanvasSize: CGSize,
+        previousTitle: String
+    )
+    case fullDocument(CompactDocumentSnapshot)
+
+    var heavyBoxes: [CompactCGImageBox] {
+        switch self {
+        case .layerRemoved(let layer, _, _, _, _, _),
+             .layerPixelsReplaced(let layer, _, _, _):
+            return layer.heavyBoxes
+        case .fullDocument(let doc):
+            return doc.heavyBoxes
+        case .background, .reorder, .layerMetadata, .layerInserted:
+            return []
+        }
+    }
+
+    static func make(
+        from old: EditorDocument,
+        previousTitle: String,
+        to new: EditorDocument,
+        currentTitle: String
+    ) -> UndoDocumentDelta {
+        // 1. Background-only change
+        if old.canvasSize == new.canvasSize && old.layers == new.layers && old.selection == new.selection && old.background != new.background {
+            return .background(previous: old.background, previousTitle: previousTitle)
+        }
+
+        // 2. Single layer inserted (e.g. paste layer, add text/shape/sticker/drawing, duplicate)
+        if new.layers.count == old.layers.count + 1 {
+            let oldIDs = Set(old.layers.map(\.id))
+            let added = new.layers.filter { !oldIDs.contains($0.id) }
+            if added.count == 1, let inserted = added.first {
+                let remainingNew = new.layers.filter { $0.id != inserted.id }
+                if remainingNew == old.layers {
+                    return .layerInserted(
+                        insertedID: inserted.id,
+                        previousSelection: old.selection,
+                        previousCanvasSize: old.canvasSize,
+                        previousBackground: old.background,
+                        previousTitle: previousTitle
+                    )
+                }
+            }
+        }
+
+        // 3. Single layer removed (e.g. delete layer)
+        if old.layers.count == new.layers.count + 1 {
+            let newIDs = Set(new.layers.map(\.id))
+            if let removedIndex = old.layers.firstIndex(where: { !newIDs.contains($0.id) }) {
+                var remainingOld = old.layers
+                let removed = remainingOld.remove(at: removedIndex)
+                if remainingOld == new.layers {
+                    return .layerRemoved(
+                        removedLayer: CompactLayerSnapshot(removed),
+                        index: removedIndex,
+                        previousSelection: old.selection,
+                        previousCanvasSize: old.canvasSize,
+                        previousBackground: old.background,
+                        previousTitle: previousTitle
+                    )
+                }
+            }
+        }
+
+        // 4. Same layer count
+        if old.layers.count == new.layers.count && old.background == new.background {
+            let oldIDs = old.layers.map(\.id)
+            let newIDs = new.layers.map(\.id)
+
+            // 4a. Pure reorder
+            if old.canvasSize == new.canvasSize && oldIDs != newIDs && Set(oldIDs) == Set(newIDs) {
+                let oldByID = Dictionary(uniqueKeysWithValues: old.layers.map { ($0.id, $0) })
+                let contentsIdentical = new.layers.allSatisfy { oldByID[$0.id] == $0 }
+                if contentsIdentical {
+                    return .reorder(
+                        previousOrder: oldIDs,
+                        previousSelection: old.selection,
+                        previousTitle: previousTitle
+                    )
+                }
+            }
+
+            // 4b. Single layer modified in place
+            if oldIDs == newIDs {
+                var diffIndices: [Int] = []
+                for idx in old.layers.indices where old.layers[idx] != new.layers[idx] {
+                    diffIndices.append(idx)
+                    if diffIndices.count > 1 { break }
+                }
+                if diffIndices.count == 1 {
+                    let idx = diffIndices[0]
+                    let oldLayer = old.layers[idx]
+                    let newLayer = new.layers[idx]
+
+                    if old.canvasSize == new.canvasSize {
+                        switch (oldLayer.kind, newLayer.kind) {
+                        case (.image(let oldImg), .image(let newImg))
+                            where oldImg.cgImage === newImg.cgImage && oldImg.alphaMask === newImg.alphaMask:
+                            return .layerMetadata(
+                                id: oldLayer.id,
+                                name: oldLayer.name,
+                                transform: oldLayer.transform,
+                                opacity: oldLayer.opacity,
+                                isHidden: oldLayer.isHidden,
+                                isLocked: oldLayer.isLocked,
+                                imageStyle: ImageStyleDelta(
+                                    filterPreset: oldImg.filterPreset,
+                                    adjustments: oldImg.adjustments,
+                                    frame: oldImg.frame
+                                ),
+                                nonImageKind: nil,
+                                previousSelection: old.selection,
+                                previousTitle: previousTitle
+                            )
+                        case (.image, _), (_, .image):
+                            return .layerPixelsReplaced(
+                                previousLayer: CompactLayerSnapshot(oldLayer),
+                                previousSelection: old.selection,
+                                previousCanvasSize: old.canvasSize,
+                                previousTitle: previousTitle
+                            )
+                        default:
+                            return .layerMetadata(
+                                id: oldLayer.id,
+                                name: oldLayer.name,
+                                transform: oldLayer.transform,
+                                opacity: oldLayer.opacity,
+                                isHidden: oldLayer.isHidden,
+                                isLocked: oldLayer.isLocked,
+                                imageStyle: nil,
+                                nonImageKind: oldLayer.kind,
+                                previousSelection: old.selection,
+                                previousTitle: previousTitle
+                            )
+                        }
+                    } else {
+                        return .layerPixelsReplaced(
+                            previousLayer: CompactLayerSnapshot(oldLayer),
+                            previousSelection: old.selection,
+                            previousCanvasSize: old.canvasSize,
+                            previousTitle: previousTitle
+                        )
+                    }
+                }
+            }
+        }
+
+        // 5. Fallback for structural whole-document ops (crop, resize, rotate90, flip, collage, loadProject)
+        return .fullDocument(CompactDocumentSnapshot(document: old, title: previousTitle))
+    }
+
+    func apply(to document: inout EditorDocument, title: inout String) -> UndoDocumentDelta? {
+        let beforeDoc = document
+        let beforeTitle = title
+
+        switch self {
+        case .background(let previous, let previousTitle):
+            document.background = previous
+            title = previousTitle
+            return .background(previous: beforeDoc.background, previousTitle: beforeTitle)
+
+        case .reorder(let previousOrder, let previousSelection, let previousTitle):
+            let byID = Dictionary(uniqueKeysWithValues: document.layers.map { ($0.id, $0) })
+            let reordered = previousOrder.compactMap { byID[$0] }
+            guard reordered.count == document.layers.count else { return nil }
+            document.layers = reordered
+            document.selection = previousSelection
+            title = previousTitle
+            return .reorder(
+                previousOrder: beforeDoc.layers.map(\.id),
+                previousSelection: beforeDoc.selection,
+                previousTitle: beforeTitle
+            )
+
+        case .layerMetadata(
+            let id,
+            let name,
+            let transform,
+            let opacity,
+            let isHidden,
+            let isLocked,
+            let imageStyle,
+            let nonImageKind,
+            let previousSelection,
+            let previousTitle
+        ):
+            guard let idx = document.layers.firstIndex(where: { $0.id == id }) else { return nil }
+            let currentLayer = document.layers[idx]
+            var inverseStyle: ImageStyleDelta? = nil
+            var inverseNonImage: LayerKind? = nil
+
+            document.layers[idx].name = name
+            document.layers[idx].transform = transform
+            document.layers[idx].opacity = opacity
+            document.layers[idx].isHidden = isHidden
+            document.layers[idx].isLocked = isLocked
+
+            if let imageStyle, case .image(var img) = currentLayer.kind {
+                inverseStyle = ImageStyleDelta(
+                    filterPreset: img.filterPreset,
+                    adjustments: img.adjustments,
+                    frame: img.frame
+                )
+                img.filterPreset = imageStyle.filterPreset
+                img.adjustments = imageStyle.adjustments
+                img.frame = imageStyle.frame
+                document.layers[idx].kind = .image(img)
+            } else if let nonImageKind {
+                inverseNonImage = currentLayer.kind
+                document.layers[idx].kind = nonImageKind
+            }
+
+            document.selection = previousSelection
+            title = previousTitle
+
+            return .layerMetadata(
+                id: id,
+                name: currentLayer.name,
+                transform: currentLayer.transform,
+                opacity: currentLayer.opacity,
+                isHidden: currentLayer.isHidden,
+                isLocked: currentLayer.isLocked,
+                imageStyle: inverseStyle,
+                nonImageKind: inverseNonImage,
+                previousSelection: beforeDoc.selection,
+                previousTitle: beforeTitle
+            )
+
+        case .layerInserted(
+            let insertedID,
+            let previousSelection,
+            let previousCanvasSize,
+            let previousBackground,
+            let previousTitle
+        ):
+            guard let idx = document.layers.firstIndex(where: { $0.id == insertedID }) else { return nil }
+            let removed = document.layers.remove(at: idx)
+            document.selection = previousSelection
+            document.canvasSize = previousCanvasSize
+            document.background = previousBackground
+            title = previousTitle
+            return .layerRemoved(
+                removedLayer: CompactLayerSnapshot(removed),
+                index: idx,
+                previousSelection: beforeDoc.selection,
+                previousCanvasSize: beforeDoc.canvasSize,
+                previousBackground: beforeDoc.background,
+                previousTitle: beforeTitle
+            )
+
+        case .layerRemoved(
+            let removedLayer,
+            let index,
+            let previousSelection,
+            let previousCanvasSize,
+            let previousBackground,
+            let previousTitle
+        ):
+            guard let restored = removedLayer.restore() else { return nil }
+            let clampedIdx = min(max(index, 0), document.layers.count)
+            document.layers.insert(restored, at: clampedIdx)
+            document.selection = previousSelection
+            document.canvasSize = previousCanvasSize
+            document.background = previousBackground
+            title = previousTitle
+            return .layerInserted(
+                insertedID: restored.id,
+                previousSelection: beforeDoc.selection,
+                previousCanvasSize: beforeDoc.canvasSize,
+                previousBackground: beforeDoc.background,
+                previousTitle: beforeTitle
+            )
+
+        case .layerPixelsReplaced(
+            let previousLayer,
+            let previousSelection,
+            let previousCanvasSize,
+            let previousTitle
+        ):
+            guard let restored = previousLayer.restore(),
+                  let idx = document.layers.firstIndex(where: { $0.id == restored.id }) else { return nil }
+            let currentLayer = document.layers[idx]
+            document.layers[idx] = restored
+            document.selection = previousSelection
+            document.canvasSize = previousCanvasSize
+            title = previousTitle
+            return .layerPixelsReplaced(
+                previousLayer: CompactLayerSnapshot(currentLayer),
+                previousSelection: beforeDoc.selection,
+                previousCanvasSize: beforeDoc.canvasSize,
+                previousTitle: beforeTitle
+            )
+
+        case .fullDocument(let snapshot):
+            guard let restored = snapshot.restore() else { return nil }
+            document = restored.document
+            title = restored.title
+            return .fullDocument(CompactDocumentSnapshot(document: beforeDoc, title: beforeTitle))
         }
     }
 }

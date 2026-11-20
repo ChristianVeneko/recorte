@@ -172,7 +172,8 @@ private struct LayerRowView: View {
     private var layerThumbnail: some View {
         switch layer.kind {
         case .image(let sendableImg):
-            Image(decorative: sendableImg.cgImage, scale: 1.0)
+            let thumb = ImageThumbnailCache.thumbnail(for: sendableImg.cgImage, maxDimension: 160)
+            Image(decorative: thumb, scale: 1.0)
                 .resizable()
                 .scaledToFill()
                 .background(Color(nsColor: .controlBackgroundColor))
