@@ -23,6 +23,7 @@ struct LayersSidebarView: View {
                         LayerRowView(
                             layer: layer,
                             iconName: model.layerDisplayIcon(for: layer),
+                            stickerBackground: model.stickerBackground(for: layer.id),
                             onToggleVisibility: { model.toggleVisibility(id: layer.id) },
                             onToggleLock: { model.toggleLock(id: layer.id) }
                         )
@@ -120,6 +121,7 @@ struct LayersSidebarView: View {
 private struct LayerRowView: View {
     let layer: Layer
     let iconName: String
+    let stickerBackground: RGBAColor?
     let onToggleVisibility: () -> Void
     let onToggleLock: () -> Void
 
@@ -192,7 +194,7 @@ private struct LayerRowView: View {
             }
         case .sticker(let spec):
             ZStack {
-                Color(nsColor: .controlBackgroundColor)
+                (stickerBackground?.swiftUIColor ?? Color(nsColor: .controlBackgroundColor))
                 switch spec.content {
                 case .emoji(let value):
                     Text(value)

@@ -35,6 +35,7 @@ struct LassoOverlayView: View {
                 )
             }
             .contentShape(Rectangle())
+            .pointerStyle(CanvasCursors.crosshairPointerStyle)
             .gesture(
                 DragGesture(minimumDistance: 0, coordinateSpace: .named("canvasStage"))
                     .onChanged { value in
@@ -148,6 +149,7 @@ struct CloneStampOverlayView: View {
                 }
             }
             .contentShape(Rectangle())
+            .pointerStyle(CanvasCursors.crosshairPointerStyle)
             .gesture(
                 DragGesture(minimumDistance: 0, coordinateSpace: .named("canvasStage"))
                     .onChanged { value in
@@ -340,6 +342,7 @@ struct PerspectiveOverlayView: View {
             .frame(width: 14, height: 14)
             .shadow(color: .black.opacity(0.35), radius: 3, y: 1)
             .position(position)
+            .pointerStyle(.grabIdle)
             .accessibilityLabel("Perspective Corner \(label)")
             .gesture(
                 DragGesture(minimumDistance: 0, coordinateSpace: .named("canvasStage"))
@@ -392,6 +395,7 @@ struct DeformOverlayView: View {
             context.stroke(circle, with: .color(.accentColor), style: StrokeStyle(lineWidth: 1, dash: [5, 4]))
         }
         .contentShape(Rectangle())
+        .pointerStyle(CanvasCursors.crosshairPointerStyle)
         .gesture(
             DragGesture(minimumDistance: 0, coordinateSpace: .named("canvasStage"))
                 .onChanged { value in

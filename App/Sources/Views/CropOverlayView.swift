@@ -8,6 +8,7 @@ struct CropOverlayView: View {
     let displayScale: CGFloat
 
     @State private var dragStartRect: CGRect?
+    @State private var isPanningCrop: Bool = false
 
     private var cropViewRect: CGRect {
         CGRect(
@@ -50,6 +51,7 @@ struct CropOverlayView: View {
                 // Drag inside to pan crop box
                 Rectangle()
                     .fill(Color.white.opacity(0.001))
+                    .pointerStyle(isPanningCrop ? .grabActive : .grabIdle)
                     .gesture(panCropGesture)
 
                 // Rule-of-thirds grid
@@ -62,31 +64,31 @@ struct CropOverlayView: View {
                     .strokeBorder(Color.white, lineWidth: 1.5)
                     .allowsHitTesting(false)
 
-                // 4 Corner handles
-                cropHandleView(isCorner: true)
+                // 4 Corner handles with directional resize cursors
+                cropHandleView(isCorner: true, edge: .topLeft)
                     .position(x: 0, y: 0)
                     .gesture(resizeHandleGesture(edge: .topLeft))
-                cropHandleView(isCorner: true)
+                cropHandleView(isCorner: true, edge: .topRight)
                     .position(x: cropViewRect.width, y: 0)
                     .gesture(resizeHandleGesture(edge: .topRight))
-                cropHandleView(isCorner: true)
+                cropHandleView(isCorner: true, edge: .bottomLeft)
                     .position(x: 0, y: cropViewRect.height)
                     .gesture(resizeHandleGesture(edge: .bottomLeft))
-                cropHandleView(isCorner: true)
+                cropHandleView(isCorner: true, edge: .bottomRight)
                     .position(x: cropViewRect.width, y: cropViewRect.height)
                     .gesture(resizeHandleGesture(edge: .bottomRight))
 
-                // 4 Edge midpoint handles
-                cropHandleView(isCorner: false)
+                // 4 Edge midpoint handles with directional resize cursors
+                cropHandleView(isCorner: false, edge: .top)
                     .position(x: cropViewRect.width / 2, y: 0)
                     .gesture(resizeHandleGesture(edge: .top))
-                cropHandleView(isCorner: false)
+                cropHandleView(isCorner: false, edge: .bottom)
                     .position(x: cropViewRect.width / 2, y: cropViewRect.height)
                     .gesture(resizeHandleGesture(edge: .bottom))
-                cropHandleView(isCorner: false)
+                cropHandleView(isCorner: false, edge: .left)
                     .position(x: 0, y: cropViewRect.height / 2)
                     .gesture(resizeHandleGesture(edge: .left))
-                cropHandleView(isCorner: false)
+                cropHandleView(isCorner: false, edge: .right)
                     .position(x: cropViewRect.width, y: cropViewRect.height / 2)
                     .gesture(resizeHandleGesture(edge: .right))
             }
@@ -154,22 +156,31 @@ struct CropOverlayView: View {
         .shadow(color: .black.opacity(0.22), radius: 8, y: 3)
     }
 
-    private func cropHandleView(isCorner: Bool) -> some View {
-        RoundedRectangle(cornerRadius: isCorner ? 3 : 2, style: .continuous)
-            .fill(Color.white)
-            .overlay(
-                RoundedRectangle(cornerRadius: isCorner ? 3 : 2, style: .continuous)
-                    .stroke(Color.black.opacity(0.35), lineWidth: 1)
-            )
-            .frame(width: isCorner ? 12 : 10, height: isCorner ? 12 : 10)
-            .shadow(color: .black.opacity(0.35), radius: 2, y: 1)
+    private func cropHandleView(isCorner: Bool, edge: HandleEdge) -> some View {
+        ZStack {
+            Color.clear
+                .frame(width: 22, height: 22)
+                .contentShape(Rectangle())
+            RoundedRectangle(cornerRadius: isCorner ? 3 : 2, style: .continuous)
+                .fill(Color.white)
+                .overlay(
+                    RoundedRectangle(cornerRadius: isCorner ? 3 : 2, style: .continuous)
+                        .stroke(Color.black.opacity(0.35), lineWidth: 1)
+                )
+                .frame(width: isCorner ? 12 : 10, height: isCorner ? 12 : 10)
+                .shadow(color: .black.opacity(0.35), radius: 2, y: 1)
+        }
+        .pointerStyle(CanvasCursors.resizePointerStyle(for: edge.resizePosition))
     }
 
     private var panCropGesture: some Gesture {
         DragGesture(minimumDistance: 1, coordinateSpace: .named("canvasStage"))
             .onChanged { value in
                 let start = dragStartRect ?? spec.rect
-                if dragStartRect == nil { dragStartRect = start }
+                if dragStartRect == nil {
+                    dragStartRect = start
+                    isPanningCrop = true
+                }
 
                 let dx = value.translation.width / max(displayScale, 0.01)
                 let dy = value.translation.height / max(displayScale, 0.01)
@@ -185,12 +196,26 @@ struct CropOverlayView: View {
             }
             .onEnded { _ in
                 dragStartRect = nil
+                isPanningCrop = false
             }
     }
 
     private enum HandleEdge {
         case topLeft, topRight, bottomLeft, bottomRight
         case top, bottom, left, right
+
+        var resizePosition: ResizeHandlePosition {
+            switch self {
+            case .topLeft: .topLeading
+            case .topRight: .topTrailing
+            case .bottomLeft: .bottomLeading
+            case .bottomRight: .bottomTrailing
+            case .top: .top
+            case .bottom: .bottom
+            case .left: .leading
+            case .right: .trailing
+            }
+        }
     }
 
     private func resizeHandleGesture(edge: HandleEdge) -> some Gesture {

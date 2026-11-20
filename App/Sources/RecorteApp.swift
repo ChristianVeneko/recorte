@@ -314,6 +314,34 @@ private struct RecorteMenuCommands: Commands {
             }
         }
 
+        CommandMenu("View") {
+            Button("Zoom In") {
+                currentModel?.zoomIn()
+            }
+            .keyboardShortcut("+", modifiers: .command)
+            .disabled(!(currentModel?.hasCanvasSurface ?? false))
+
+            Button("Zoom Out") {
+                currentModel?.zoomOut()
+            }
+            .keyboardShortcut("-", modifiers: .command)
+            .disabled(!(currentModel?.hasCanvasSurface ?? false))
+
+            Divider()
+
+            Button("Zoom to Fit") {
+                currentModel?.zoomToFit()
+            }
+            .keyboardShortcut("0", modifiers: .command)
+            .disabled(!(currentModel?.hasCanvasSurface ?? false))
+
+            Button("Actual Size") {
+                currentModel?.zoomToActualSize()
+            }
+            .keyboardShortcut("1", modifiers: .command)
+            .disabled(!(currentModel?.hasCanvasSurface ?? false))
+        }
+
         CommandGroup(after: .windowArrangement) {
             Button("Merge All Windows into Tabs") {
                 NSApp.sendAction(#selector(NSWindow.mergeAllWindows(_:)), to: nil, from: nil)

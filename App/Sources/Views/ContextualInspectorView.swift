@@ -20,6 +20,12 @@ struct ContextualInspectorView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
+                if let layer = model.selectedLayer,
+                   model.activeTool != .crop && model.activeTool != .perspective {
+                    layerOpacitySection(for: layer)
+                    Divider()
+                }
+
                 contextualPrimarySection
 
                 if let layer = model.selectedLayer,
@@ -75,7 +81,7 @@ struct ContextualInspectorView: View {
             shapesInspectorSection
         case .stickers:
             stickersInspectorSection
-        case .move:
+        case .move, .eraser:
             selectedLayerInspectorSection
         }
     }
@@ -1214,10 +1220,24 @@ struct ContextualInspectorView: View {
             }
         }()
 
+        let activeStickerBackground: RGBAColor? = {
+            if let (layerID, _) = editingSticker {
+                return model.stickerBackground(for: layerID)
+            }
+            return model.defaultStickerBackground
+        }()
+
+        let isEditingSFSymbol: Bool = {
+            if let (_, spec) = editingSticker, case .sfSymbol = spec.content {
+                return true
+            }
+            return false
+        }()
+
         VStack(alignment: .leading, spacing: 10) {
             Picker("Type", selection: $stickerTab) {
                 Text("Emoji").tag(StickerPickerTab.emoji)
-                Text("SF Symbols").tag(StickerPickerTab.sfSymbols)
+                Text("Symbols").tag(StickerPickerTab.sfSymbols)
             }
             .pickerStyle(.segmented)
             .controlSize(.small)
@@ -1240,7 +1260,39 @@ struct ContextualInspectorView: View {
                 onEnd: { model.endContinuousEdit(actionName: "Resize Sticker") }
             )
 
-            if stickerTab == .sfSymbols {
+            // S21: Solid background badge for stickers (applies live to selected sticker and default for new stickers)
+            Toggle(
+                "Solid Background",
+                isOn: Binding(
+                    get: { activeStickerBackground != nil },
+                    set: { enabled in
+                        let newColor: RGBAColor? = enabled ? model.lastSolidStickerBackgroundColor : nil
+                        model.defaultStickerBackground = newColor
+                        if let (layerID, _) = editingSticker {
+                            model.setStickerBackground(newColor, for: layerID)
+                        }
+                    }
+                )
+            )
+
+            if let bgColor = activeStickerBackground {
+                ColorPicker(
+                    "Background Color",
+                    selection: Binding(
+                        get: { bgColor.swiftUIColor },
+                        set: { newColor in
+                            let rgba = RGBAColor(swiftUIColor: newColor)
+                            model.lastSolidStickerBackgroundColor = rgba
+                            model.defaultStickerBackground = rgba
+                            if let (layerID, _) = editingSticker {
+                                model.setStickerBackground(rgba, for: layerID)
+                            }
+                        }
+                    )
+                )
+            }
+
+            if stickerTab == .sfSymbols || isEditingSFSymbol {
                 ColorPicker(
                     "Tint",
                     selection: Binding(
@@ -1256,12 +1308,16 @@ struct ContextualInspectorView: View {
                         }
                     )
                 )
+            }
 
+            if stickerTab == .sfSymbols {
                 LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 5), spacing: 6) {
                     ForEach(StickerCatalog.sfSymbols, id: \.self) { symbol in
+                        let displayName = StickerDisplayName.humanName(for: symbol)
                         Button {
                             model.addStickerLayer(
-                                .sfSymbol(symbol, pointSize: model.defaultStickerPointSize, tintColor: model.defaultStickerTint)
+                                .sfSymbol(symbol, pointSize: model.defaultStickerPointSize, tintColor: model.defaultStickerTint),
+                                background: model.defaultStickerBackground
                             )
                         } label: {
                             Image(systemName: symbol)
@@ -1269,7 +1325,8 @@ struct ContextualInspectorView: View {
                                 .frame(maxWidth: .infinity, minHeight: 32)
                         }
                         .buttonStyle(.bordered)
-                        .help(symbol)
+                        .help(displayName)
+                        .accessibilityLabel(displayName)
                     }
                 }
             } else {
@@ -1284,7 +1341,10 @@ struct ContextualInspectorView: View {
                 LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 6), spacing: 6) {
                     ForEach(emojis, id: \.self) { emoji in
                         Button {
-                            model.addStickerLayer(.emoji(emoji, pointSize: model.defaultStickerPointSize))
+                            model.addStickerLayer(
+                                .emoji(emoji, pointSize: model.defaultStickerPointSize),
+                                background: model.defaultStickerBackground
+                            )
                         } label: {
                             Text(emoji)
                                 .font(.title2)
@@ -1354,6 +1414,43 @@ struct ContextualInspectorView: View {
             Text("Drag on the canvas to paint strokes with \(model.drawingToolKind.rawValue).")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: - S22 Layer Opacity (Top of Inspector)
+
+    @ViewBuilder
+    private func layerOpacitySection(for layer: Layer) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Text(layer.name)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Spacer()
+                Text("\(Int((layer.opacity * 100).rounded()))%")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(spacing: 8) {
+                Text("Opacity")
+                    .font(.caption)
+                Slider(
+                    value: Binding(
+                        get: { layer.opacity },
+                        set: { model.setOpacity(id: layer.id, opacity: $0, continuous: true) }
+                    ),
+                    in: 0...1,
+                    onEditingChanged: { editing in
+                        if !editing {
+                            model.endContinuousEdit(actionName: "Change Opacity")
+                        }
+                    }
+                )
+                .controlSize(.small)
+                .accessibilityLabel("Layer Opacity")
+            }
         }
     }
 
@@ -1437,7 +1534,7 @@ struct ContextualInspectorView: View {
                         return false
                     },
                     set: { isSolid in
-                        model.setCanvasBackground(isSolid ? .solid(.white) : .transparent)
+                        model.setCanvasBackground(isSolid ? .solid(model.lastSolidCanvasBackgroundColor) : .transparent)
                     }
                 )
             )

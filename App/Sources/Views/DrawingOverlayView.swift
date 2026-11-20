@@ -58,6 +58,7 @@ struct DrawingOverlayView: View {
             }
         }
         .contentShape(Rectangle())
+        .pointerStyle(CanvasCursors.crosshairPointerStyle)
         .gesture(
             DragGesture(minimumDistance: 0, coordinateSpace: .named("canvasStage"))
                 .onChanged { value in

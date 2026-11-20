@@ -69,6 +69,15 @@ public final class EditorModel: Identifiable {
     )
     public var defaultStickerPointSize: Double = 72.0
     public var defaultStickerTint: RGBAColor = .white
+    public var defaultStickerBackground: RGBAColor? = nil
+    public var lastSolidStickerBackgroundColor: RGBAColor = .white
+    public var lastSolidCanvasBackgroundColor: RGBAColor = .white
+    public var stickerBackgrounds: [UUID: RGBAColor] = [:]
+
+    // S24 Viewport & 60fps Live Transform Preview
+    public var viewport: CanvasViewport = CanvasViewport()
+    public var liveTransformPreview: LiveTransformPreview?
+    public private(set) var renderCount: Int = 0
 
     // S15 interactive image tool state
     public var lassoPoints: [CGPoint] = []
@@ -84,6 +93,16 @@ public final class EditorModel: Identifiable {
     public var toneCurve: ToneCurveSpec = ToneCurveSpec()
 
     private var continuousEditStartDocument: EditorDocument?
+    private var continuousEditStartStickerBackgrounds: [UUID: RGBAColor]?
+
+    public struct LiveTransformPreview: Sendable {
+        public let layerID: UUID
+        public let startTransform: LayerTransform
+        public var currentTransform: LayerTransform
+        public let split: LiveTransformSplit
+        public var isRotating: Bool
+        public var isShiftSnapped: Bool
+    }
 
     public init(
         id: UUID = UUID(),
@@ -143,8 +162,10 @@ public final class EditorModel: Identifiable {
     private func registerUndoSnapshot(
         previousDoc: EditorDocument,
         previousTitle: String,
+        previousStickerBackgrounds: [UUID: RGBAColor]? = nil,
         actionName: String
     ) {
+        let backgroundsSnapshot = previousStickerBackgrounds ?? stickerBackgrounds
         let shouldManageGroup = !undoManager.isUndoing && !undoManager.isRedoing && undoManager.groupingLevel == 0
         let previousGroupsByEvent = undoManager.groupsByEvent
         if shouldManageGroup {
@@ -153,7 +174,12 @@ public final class EditorModel: Identifiable {
         }
         undoManager.registerUndo(withTarget: self) { target in
             MainActor.assumeIsolated {
-                target.applyDocumentSnapshot(previousDoc, titleSnapshot: previousTitle, actionName: actionName)
+                target.applyDocumentSnapshot(
+                    previousDoc,
+                    titleSnapshot: previousTitle,
+                    stickerBackgroundsSnapshot: backgroundsSnapshot,
+                    actionName: actionName
+                )
             }
         }
         undoManager.setActionName(actionName)
@@ -163,11 +189,19 @@ public final class EditorModel: Identifiable {
         }
     }
 
-    private func applyDocumentSnapshot(_ snapshot: EditorDocument, titleSnapshot: String, actionName: String) {
+    private func applyDocumentSnapshot(
+        _ snapshot: EditorDocument,
+        titleSnapshot: String,
+        stickerBackgroundsSnapshot: [UUID: RGBAColor],
+        actionName: String
+    ) {
         let previousDoc = document
         let previousTitle = title
+        let previousBackgrounds = stickerBackgrounds
+        liveTransformPreview = nil
         document = snapshot
         title = titleSnapshot
+        stickerBackgrounds = stickerBackgroundsSnapshot
         if activeTool == .crop {
             cropSpec = nil
             activeTool = .move
@@ -178,12 +212,18 @@ public final class EditorModel: Identifiable {
         }
         rerender()
 
-        registerUndoSnapshot(previousDoc: previousDoc, previousTitle: previousTitle, actionName: actionName)
+        registerUndoSnapshot(
+            previousDoc: previousDoc,
+            previousTitle: previousTitle,
+            previousStickerBackgrounds: previousBackgrounds,
+            actionName: actionName
+        )
     }
 
     private func commitMutation(actionName: String, _ mutation: (inout EditorDocument) -> Void) {
         let previousDoc = document
         let previousTitle = title
+        let previousBackgrounds = stickerBackgrounds
         var nextDoc = document
         mutation(&nextDoc)
         guard nextDoc != previousDoc else { return }
@@ -191,21 +231,161 @@ public final class EditorModel: Identifiable {
         document = nextDoc
         rerender()
 
-        registerUndoSnapshot(previousDoc: previousDoc, previousTitle: previousTitle, actionName: actionName)
+        registerUndoSnapshot(
+            previousDoc: previousDoc,
+            previousTitle: previousTitle,
+            previousStickerBackgrounds: previousBackgrounds,
+            actionName: actionName
+        )
+    }
+
+    private func commitMutationWithState(
+        actionName: String,
+        _ mutation: (inout EditorDocument, inout [UUID: RGBAColor]) -> Void
+    ) {
+        let previousDoc = document
+        let previousTitle = title
+        let previousBackgrounds = stickerBackgrounds
+        var nextDoc = document
+        var nextBackgrounds = stickerBackgrounds
+        mutation(&nextDoc, &nextBackgrounds)
+        guard nextDoc != previousDoc || nextBackgrounds != previousBackgrounds else { return }
+
+        document = nextDoc
+        stickerBackgrounds = nextBackgrounds
+        rerender()
+
+        registerUndoSnapshot(
+            previousDoc: previousDoc,
+            previousTitle: previousTitle,
+            previousStickerBackgrounds: previousBackgrounds,
+            actionName: actionName
+        )
     }
 
     public func beginContinuousEdit() {
         if continuousEditStartDocument == nil {
             continuousEditStartDocument = document
+            continuousEditStartStickerBackgrounds = stickerBackgrounds
         }
     }
 
     public func endContinuousEdit(actionName: String) {
         guard let startDoc = continuousEditStartDocument else { return }
+        let startBackgrounds = continuousEditStartStickerBackgrounds ?? stickerBackgrounds
         continuousEditStartDocument = nil
-        guard startDoc != document else { return }
+        continuousEditStartStickerBackgrounds = nil
+        guard startDoc != document || startBackgrounds != stickerBackgrounds else { return }
 
-        registerUndoSnapshot(previousDoc: startDoc, previousTitle: title, actionName: actionName)
+        registerUndoSnapshot(
+            previousDoc: startDoc,
+            previousTitle: title,
+            previousStickerBackgrounds: startBackgrounds,
+            actionName: actionName
+        )
+    }
+
+    // MARK: - S24 Viewport & 60fps Live Transform
+
+    public func zoomToFit() {
+        viewport.zoomToFit()
+    }
+
+    public func zoomToActualSize() {
+        viewport.zoomToActualSize()
+    }
+
+    public func zoomIn() {
+        viewport.zoomIn()
+    }
+
+    public func zoomOut() {
+        viewport.zoomOut()
+    }
+
+    public func toggleSmartZoom(around pointer: CGPoint? = nil, baseCenter: CGPoint = .zero) {
+        viewport.toggleSmartZoom(around: pointer, baseCenter: baseCenter)
+    }
+
+    public func beginLiveTransform(for layerID: UUID, isRotating: Bool = false) {
+        guard let layer = document.layer(id: layerID), !layer.isLocked else { return }
+        if liveTransformPreview?.layerID == layerID {
+            liveTransformPreview?.isRotating = isRotating
+            return
+        }
+        beginContinuousEdit()
+        guard let split = DocumentRenderer.renderLiveTransformSplit(
+            document,
+            activeLayerID: layerID,
+            stickerBackgrounds: stickerBackgrounds
+        ) else { return }
+
+        liveTransformPreview = LiveTransformPreview(
+            layerID: layerID,
+            startTransform: layer.transform,
+            currentTransform: layer.transform,
+            split: split,
+            isRotating: isRotating,
+            isShiftSnapped: false
+        )
+    }
+
+    public func updateLiveTransform(
+        _ transform: LayerTransform,
+        isRotating: Bool? = nil,
+        isShiftSnapped: Bool = false
+    ) {
+        guard var preview = liveTransformPreview else { return }
+        preview.currentTransform = transform
+        if let isRotating {
+            preview.isRotating = isRotating
+        }
+        preview.isShiftSnapped = isShiftSnapped
+        liveTransformPreview = preview
+    }
+
+    public func endLiveTransform(actionName: String) {
+        guard let preview = liveTransformPreview else {
+            endContinuousEdit(actionName: actionName)
+            return
+        }
+        liveTransformPreview = nil
+
+        if preview.currentTransform != preview.startTransform,
+           let idx = document.layers.firstIndex(where: { $0.id == preview.layerID }),
+           !document.layers[idx].isLocked {
+            document.layers[idx].transform = preview.currentTransform
+            rerender()
+        }
+        endContinuousEdit(actionName: actionName)
+    }
+
+    /// Handles MacBook trackpad two-finger rotation events smoothly at 60fps, committing on gesture end.
+    public func handleTrackpadRotate(deltaDegrees: Double, phase: NSEvent.Phase) {
+        guard activeTool != .crop && activeTool != .perspective,
+              let layer = selectedLayer,
+              !layer.isLocked else {
+            return
+        }
+
+        if phase.contains(.began) || liveTransformPreview?.layerID != layer.id {
+            beginLiveTransform(for: layer.id, isRotating: true)
+        }
+
+        if var preview = liveTransformPreview, preview.layerID == layer.id {
+            var next = preview.currentTransform
+            let rawDegrees = next.rotationDegrees + deltaDegrees
+            let shiftHeld = NSEvent.modifierFlags.contains(.shift)
+            next.rotationDegrees = RotationMath.snapDegrees(rawDegrees, increment: 15.0, isShiftPressed: shiftHeld)
+            preview.currentTransform = next
+            preview.isRotating = true
+            preview.isShiftSnapped = shiftHeld
+            liveTransformPreview = preview
+        }
+
+        if phase.contains(.ended) || phase.contains(.cancelled) {
+            endLiveTransform(actionName: "Rotate Layer")
+        }
     }
 
     // MARK: - Rendering
@@ -219,7 +399,12 @@ public final class EditorModel: Identifiable {
             renderedImage = nil
             return
         }
-        renderedImage = try? Renderer.render(document, scale: 1.0)
+        renderedImage = try? DocumentRenderer.render(
+            document,
+            stickerBackgrounds: stickerBackgrounds,
+            scale: 1.0
+        )
+        renderCount += 1
     }
 
     public func renderComposite() -> CGImage? {
@@ -232,11 +417,23 @@ public final class EditorModel: Identifiable {
 
     // MARK: - S13: .recorte Projects, PDF Export, Save to Downloads
 
+    private static let stickerBackgroundsFilename = "sticker-backgrounds.json"
+
     public func saveProject(to url: URL) throws {
         let packageURL = url.pathExtension.lowercased() == RecorteProject.fileExtension
             ? url
             : url.appendingPathExtension(RecorteProject.fileExtension)
         try RecorteProject.save(document, to: packageURL)
+
+        let bgURL = packageURL.appendingPathComponent(Self.stickerBackgroundsFilename)
+        if stickerBackgrounds.isEmpty {
+            try? FileManager.default.removeItem(at: bgURL)
+        } else {
+            let keyed = Dictionary(uniqueKeysWithValues: stickerBackgrounds.map { ($0.key.uuidString, $0.value) })
+            let data = try JSONEncoder().encode(keyed)
+            try data.write(to: bgURL, options: .atomic)
+        }
+
         projectURL = packageURL
         let baseName = packageURL.deletingPathExtension().lastPathComponent
         if !baseName.isEmpty {
@@ -247,28 +444,48 @@ public final class EditorModel: Identifiable {
 
     public func loadProject(from url: URL) throws {
         let loadedDocument = try RecorteProject.load(from: url)
+        var loadedBackgrounds: [UUID: RGBAColor] = [:]
+        let bgURL = url.appendingPathComponent(Self.stickerBackgroundsFilename)
+        if let data = try? Data(contentsOf: bgURL),
+           let decoded = try? JSONDecoder().decode([String: RGBAColor].self, from: data) {
+            for (key, value) in decoded {
+                if let uuid = UUID(uuidString: key) {
+                    loadedBackgrounds[uuid] = value
+                }
+            }
+        }
+
         let previousDoc = document
         let previousTitle = title
+        let previousBackgrounds = stickerBackgrounds
         let baseName = url.deletingPathExtension().lastPathComponent
         let newTitle = baseName.isEmpty ? "Untitled" : baseName
 
         cropSpec = nil
         perspectiveQuad = nil
         lassoPoints = []
+        liveTransformPreview = nil
         activeTool = .move
         document = loadedDocument
+        stickerBackgrounds = loadedBackgrounds
         title = newTitle
         projectURL = url
         rerender()
 
-        registerUndoSnapshot(previousDoc: previousDoc, previousTitle: previousTitle, actionName: "Open Project")
+        registerUndoSnapshot(
+            previousDoc: previousDoc,
+            previousTitle: previousTitle,
+            previousStickerBackgrounds: previousBackgrounds,
+            actionName: "Open Project"
+        )
     }
 
     public func exportPDF(to url: URL) throws {
         guard hasCanvasSurface else {
             throw RecorteProjectError.pdfCreationFailed
         }
-        try RecorteProject.exportPDF(document, to: url, scale: 1.0)
+        let prepared = DocumentRenderer.prepareForRendering(document, stickerBackgrounds: stickerBackgrounds)
+        try RecorteProject.exportPDF(prepared, to: url, scale: 1.0)
         statusMessage = "Exported \(url.lastPathComponent)"
     }
 
@@ -466,6 +683,7 @@ public final class EditorModel: Identifiable {
 
         let previousDoc = document
         let previousTitle = title
+        let previousBackgrounds = stickerBackgrounds
 
         var nextDoc = EditorDocument(
             canvasSize: newSize,
@@ -481,11 +699,18 @@ public final class EditorModel: Identifiable {
         nextDoc.add(croppedLayer)
 
         cropSpec = nil
+        liveTransformPreview = nil
         activeTool = .move
         document = nextDoc
+        stickerBackgrounds = [:]
         rerender()
 
-        registerUndoSnapshot(previousDoc: previousDoc, previousTitle: previousTitle, actionName: "Crop")
+        registerUndoSnapshot(
+            previousDoc: previousDoc,
+            previousTitle: previousTitle,
+            previousStickerBackgrounds: previousBackgrounds,
+            actionName: "Crop"
+        )
     }
 
     public func cancelCrop() {
@@ -857,17 +1082,25 @@ public final class EditorModel: Identifiable {
         )
         let previousDoc = document
         let previousTitle = title
+        let previousBackgrounds = stickerBackgrounds
 
         cropSpec = nil
         perspectiveQuad = nil
         lassoPoints = []
+        liveTransformPreview = nil
         activeTool = .move
         document = collageDoc
+        stickerBackgrounds = [:]
         title = layout == .freeStyle ? "Free Style Canvas" : "Collage"
         projectURL = nil
         rerender()
 
-        registerUndoSnapshot(previousDoc: previousDoc, previousTitle: previousTitle, actionName: "New Collage")
+        registerUndoSnapshot(
+            previousDoc: previousDoc,
+            previousTitle: previousTitle,
+            previousStickerBackgrounds: previousBackgrounds,
+            actionName: "New Collage"
+        )
     }
 
     // MARK: - Layer Creation
@@ -890,16 +1123,7 @@ public final class EditorModel: Identifiable {
     public func addShapeLayer(_ spec: ShapeSpec? = nil, at position: CGPoint? = nil) {
         let resolved = spec ?? defaultShapeSpec
         let pos = position ?? canvasCenter
-        let name: String = switch resolved.kind {
-        case .rect: "Rectangle"
-        case .roundedRect: "Rounded Rect"
-        case .ellipse: "Ellipse"
-        case .line: "Line"
-        case .arrow: "Arrow"
-        case .triangle: "Triangle"
-        case .star: "Star"
-        default: "Shape"
-        }
+        let name = StickerDisplayName.layerName(for: resolved.kind)
         commitMutation(actionName: "Add \(name)") { doc in
             let layer = Layer(
                 name: name,
@@ -910,19 +1134,55 @@ public final class EditorModel: Identifiable {
         }
     }
 
-    public func addStickerLayer(_ spec: StickerSpec, at position: CGPoint? = nil) {
+    public func addStickerLayer(
+        _ spec: StickerSpec,
+        at position: CGPoint? = nil,
+        background: RGBAColor? = nil
+    ) {
         let pos = position ?? canvasCenter
-        let name: String = switch spec.content {
-        case .emoji(let value): "Sticker \(value)"
-        case .sfSymbol(let symbol): symbol
-        }
-        commitMutation(actionName: "Add Sticker") { doc in
+        let name = StickerDisplayName.layerName(for: spec)
+        let resolvedBackground = background ?? defaultStickerBackground
+        commitMutationWithState(actionName: "Add Sticker") { doc, backgrounds in
             let layer = Layer(
                 name: name,
                 kind: .sticker(spec),
                 transform: LayerTransform(position: pos)
             )
             doc.add(layer)
+            if let resolvedBackground {
+                backgrounds[layer.id] = resolvedBackground
+            }
+        }
+    }
+
+    public func stickerBackground(for layerID: UUID) -> RGBAColor? {
+        stickerBackgrounds[layerID]
+    }
+
+    public func setStickerBackground(_ color: RGBAColor?, for layerID: UUID, continuous: Bool = false) {
+        guard let idx = document.layers.firstIndex(where: { $0.id == layerID }),
+              !document.layers[idx].isLocked else { return }
+
+        if let color {
+            lastSolidStickerBackgroundColor = color
+        }
+
+        if continuous {
+            beginContinuousEdit()
+            if let color {
+                stickerBackgrounds[layerID] = color
+            } else {
+                stickerBackgrounds.removeValue(forKey: layerID)
+            }
+            rerender()
+        } else {
+            commitMutationWithState(actionName: "Change Sticker Background") { _, backgrounds in
+                if let color {
+                    backgrounds[layerID] = color
+                } else {
+                    backgrounds.removeValue(forKey: layerID)
+                }
+            }
         }
     }
 
@@ -968,8 +1228,10 @@ public final class EditorModel: Identifiable {
     }
 
     public func duplicateLayer(id: UUID) {
-        commitMutation(actionName: "Duplicate Layer") { doc in
-            doc.duplicate(id: id)
+        commitMutationWithState(actionName: "Duplicate Layer") { doc, backgrounds in
+            if let copy = doc.duplicate(id: id), let bg = backgrounds[id] {
+                backgrounds[copy.id] = bg
+            }
         }
     }
 
@@ -979,8 +1241,9 @@ public final class EditorModel: Identifiable {
     }
 
     public func deleteLayer(id: UUID) {
-        commitMutation(actionName: "Delete Layer") { doc in
+        commitMutationWithState(actionName: "Delete Layer") { doc, backgrounds in
             doc.remove(id: id)
+            backgrounds.removeValue(forKey: id)
         }
     }
 
@@ -1206,9 +1469,18 @@ public final class EditorModel: Identifiable {
         }
     }
 
-    public func setCanvasBackground(_ background: CanvasBackground) {
-        commitMutation(actionName: "Change Background") { doc in
-            doc.background = background
+    public func setCanvasBackground(_ background: CanvasBackground, continuous: Bool = false) {
+        if case .solid(let color) = background {
+            lastSolidCanvasBackgroundColor = color
+        }
+        if continuous {
+            beginContinuousEdit()
+            document.background = background
+            rerender()
+        } else {
+            commitMutation(actionName: "Change Background") { doc in
+                doc.background = background
+            }
         }
     }
 
@@ -1309,8 +1581,10 @@ public final class EditorModel: Identifiable {
             }
             return CGSize(width: 120, height: 40)
         case .sticker(let spec):
-            let dim = max(32, CGFloat(spec.pointSize) * 1.25)
-            return CGSize(width: dim, height: dim)
+            return DocumentRenderer.stickerLogicalSize(
+                for: spec,
+                hasBackground: stickerBackgrounds[layer.id] != nil
+            )
         case .drawing(let spec):
             let allPts = spec.strokes.flatMap(\.points)
             guard let first = allPts.first else { return document.canvasSize }

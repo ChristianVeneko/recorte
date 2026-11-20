@@ -1,3 +1,4 @@
+import AppKit
 import RecorteCore
 import SwiftUI
 
@@ -8,81 +9,158 @@ struct SelectionOverlayView: View {
     let displayScale: CGFloat
 
     @State private var dragStartTransform: LayerTransform?
+    @State private var isMoving: Bool = false
+    @State private var isRotatingHandle: Bool = false
+
+    private var activeTransform: LayerTransform {
+        if let preview = model.liveTransformPreview, preview.layerID == layer.id {
+            return preview.currentTransform
+        }
+        return layer.transform
+    }
+
+    private var isShowingRotationBadge: Bool {
+        if isRotatingHandle { return true }
+        if let preview = model.liveTransformPreview,
+           preview.layerID == layer.id,
+           preview.isRotating {
+            return true
+        }
+        return false
+    }
+
+    private var isShiftSnapped: Bool {
+        if let preview = model.liveTransformPreview, preview.layerID == layer.id {
+            return preview.isShiftSnapped
+        }
+        return false
+    }
 
     private var intrinsicSize: CGSize {
         model.layerIntrinsicSize(for: layer)
     }
 
     private var boxWidth: CGFloat {
-        max(20, intrinsicSize.width * abs(layer.transform.scale.width) * displayScale)
+        max(20, intrinsicSize.width * abs(activeTransform.scale.width) * displayScale)
     }
 
     private var boxHeight: CGFloat {
-        max(20, intrinsicSize.height * abs(layer.transform.scale.height) * displayScale)
+        max(20, intrinsicSize.height * abs(activeTransform.scale.height) * displayScale)
     }
 
     private var centerInView: CGPoint {
         CGPoint(
-            x: canvasFrame.minX + layer.transform.position.x * displayScale,
-            y: canvasFrame.minY + layer.transform.position.y * displayScale
+            x: canvasFrame.minX + activeTransform.position.x * displayScale,
+            y: canvasFrame.minY + activeTransform.position.y * displayScale
+        )
+    }
+
+    private var rotationBadgePosition: CGPoint {
+        let stemRadius = (boxHeight / 2.0) + 46.0
+        let rad = CGFloat(activeTransform.rotationDegrees) * .pi / 180.0
+        return CGPoint(
+            x: centerInView.x + stemRadius * sin(rad),
+            y: centerInView.y - stemRadius * cos(rad)
         )
     }
 
     var body: some View {
         ZStack {
-            // Selection box & move gesture
-            Rectangle()
-                .fill(Color.accentColor.opacity(0.001))
-                .overlay(
-                    Rectangle()
-                        .strokeBorder(
-                            layer.isLocked ? Color.secondary : Color.accentColor,
-                            style: StrokeStyle(lineWidth: 1.5, dash: layer.isLocked ? [4, 4] : [])
-                        )
-                )
-                .frame(width: boxWidth, height: boxHeight)
-                .gesture(moveGesture)
+            ZStack {
+                // Selection box & move gesture (open hand on hover, closed hand while dragging)
+                Rectangle()
+                    .fill(Color.accentColor.opacity(0.001))
+                    .overlay(
+                        Rectangle()
+                            .strokeBorder(
+                                layer.isLocked ? Color.secondary : Color.accentColor,
+                                style: StrokeStyle(lineWidth: 1.5, dash: layer.isLocked ? [4, 4] : [])
+                            )
+                    )
+                    .frame(width: boxWidth, height: boxHeight)
+                    .pointerStyle(layer.isLocked ? .default : (isMoving ? .grabActive : .grabIdle))
+                    .gesture(moveGesture)
 
-            if !layer.isLocked {
-                // Top rotation stem + knob
-                VStack(spacing: 0) {
-                    Circle()
-                        .fill(Color.white)
-                        .overlay(Circle().stroke(Color.accentColor, lineWidth: 1.5))
-                        .frame(width: 12, height: 12)
-                        .shadow(color: .black.opacity(0.25), radius: 2, y: 1)
+                if !layer.isLocked {
+                    // Top rotation stem + knob with custom rotate cursor
+                    VStack(spacing: 0) {
+                        ZStack {
+                            Color.clear
+                                .frame(width: 24, height: 24)
+                                .contentShape(Circle())
+                            Circle()
+                                .fill(Color.white)
+                                .overlay(Circle().stroke(Color.accentColor, lineWidth: 1.5))
+                                .frame(width: 12, height: 12)
+                                .shadow(color: .black.opacity(0.25), radius: 2, y: 1)
+                        }
+                        .pointerStyle(CanvasCursors.rotatePointerStyle)
                         .gesture(rotateGesture)
-                    Rectangle()
-                        .fill(Color.accentColor)
-                        .frame(width: 1.5, height: 18)
-                }
-                .offset(y: -(boxHeight / 2.0) - 15)
 
-                // 4 corner resize handles
-                cornerHandle(xSign: -1, ySign: -1)
-                    .offset(x: -boxWidth / 2.0, y: -boxHeight / 2.0)
-                cornerHandle(xSign: 1, ySign: -1)
-                    .offset(x: boxWidth / 2.0, y: -boxHeight / 2.0)
-                cornerHandle(xSign: -1, ySign: 1)
-                    .offset(x: -boxWidth / 2.0, y: boxHeight / 2.0)
-                cornerHandle(xSign: 1, ySign: 1)
-                    .offset(x: boxWidth / 2.0, y: boxHeight / 2.0)
+                        Rectangle()
+                            .fill(Color.accentColor)
+                            .frame(width: 1.5, height: 14)
+                            .allowsHitTesting(false)
+                    }
+                    .offset(y: -(boxHeight / 2.0) - 19)
+
+                    // 4 corner resize handles with rotation-aware resize cursors
+                    cornerHandle(xSign: -1, ySign: -1)
+                        .offset(x: -boxWidth / 2.0, y: -boxHeight / 2.0)
+                    cornerHandle(xSign: 1, ySign: -1)
+                        .offset(x: boxWidth / 2.0, y: -boxHeight / 2.0)
+                    cornerHandle(xSign: -1, ySign: 1)
+                        .offset(x: -boxWidth / 2.0, y: boxHeight / 2.0)
+                    cornerHandle(xSign: 1, ySign: 1)
+                        .offset(x: boxWidth / 2.0, y: boxHeight / 2.0)
+                }
+            }
+            .rotationEffect(.degrees(activeTransform.rotationDegrees))
+            .position(centerInView)
+
+            // S25: Upright Liquid Glass angle badge while rotating via handle or trackpad
+            if isShowingRotationBadge {
+                HStack(spacing: 4) {
+                    Text(RotationMath.formattedAngle(activeTransform.rotationDegrees))
+                        .font(.caption.weight(.semibold).monospacedDigit())
+                    if isShiftSnapped {
+                        Image(systemName: "angle")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .glassEffect(.regular, in: Capsule())
+                .shadow(color: .black.opacity(0.22), radius: 6, y: 2)
+                .position(rotationBadgePosition)
+                .allowsHitTesting(false)
             }
         }
-        .rotationEffect(.degrees(layer.transform.rotationDegrees))
-        .position(centerInView)
     }
 
     private func cornerHandle(xSign: CGFloat, ySign: CGFloat) -> some View {
-        RoundedRectangle(cornerRadius: 2.5, style: .continuous)
-            .fill(Color.white)
-            .overlay(
-                RoundedRectangle(cornerRadius: 2.5, style: .continuous)
-                    .stroke(Color.accentColor, lineWidth: 1.5)
-            )
-            .frame(width: 10, height: 10)
-            .shadow(color: .black.opacity(0.25), radius: 2, y: 1)
-            .gesture(resizeGesture(xSign: xSign, ySign: ySign))
+        let cursorPos = CanvasCursorLogic.resizePosition(
+            xSign: xSign,
+            ySign: ySign,
+            layerRotationDegrees: activeTransform.rotationDegrees
+        )
+
+        return ZStack {
+            Color.clear
+                .frame(width: 20, height: 20)
+                .contentShape(Rectangle())
+            RoundedRectangle(cornerRadius: 2.5, style: .continuous)
+                .fill(Color.white)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 2.5, style: .continuous)
+                        .stroke(Color.accentColor, lineWidth: 1.5)
+                )
+                .frame(width: 10, height: 10)
+                .shadow(color: .black.opacity(0.25), radius: 2, y: 1)
+        }
+        .pointerStyle(CanvasCursors.resizePointerStyle(for: cursorPos))
+        .gesture(resizeGesture(xSign: xSign, ySign: ySign))
     }
 
     private var moveGesture: some Gesture {
@@ -92,16 +170,19 @@ struct SelectionOverlayView: View {
                 let start = dragStartTransform ?? layer.transform
                 if dragStartTransform == nil {
                     dragStartTransform = start
+                    isMoving = true
+                    model.beginLiveTransform(for: layer.id, isRotating: false)
                 }
                 let dx = value.translation.width / max(displayScale, 0.01)
                 let dy = value.translation.height / max(displayScale, 0.01)
                 var next = start
                 next.position = CGPoint(x: start.position.x + dx, y: start.position.y + dy)
-                model.setLayerTransform(id: layer.id, transform: next, continuous: true, actionName: "Move Layer")
+                model.updateLiveTransform(next, isRotating: false)
             }
             .onEnded { _ in
                 dragStartTransform = nil
-                model.endContinuousEdit(actionName: "Move Layer")
+                isMoving = false
+                model.endLiveTransform(actionName: "Move Layer")
             }
     }
 
@@ -112,6 +193,7 @@ struct SelectionOverlayView: View {
                 let start = dragStartTransform ?? layer.transform
                 if dragStartTransform == nil {
                     dragStartTransform = start
+                    model.beginLiveTransform(for: layer.id, isRotating: false)
                 }
                 let startCenter = CGPoint(
                     x: canvasFrame.minX + start.position.x * displayScale,
@@ -128,11 +210,11 @@ struct SelectionOverlayView: View {
                     width: start.scale.width * factor,
                     height: start.scale.height * factor
                 )
-                model.setLayerTransform(id: layer.id, transform: next, continuous: true, actionName: "Resize Layer")
+                model.updateLiveTransform(next, isRotating: false)
             }
             .onEnded { _ in
                 dragStartTransform = nil
-                model.endContinuousEdit(actionName: "Resize Layer")
+                model.endLiveTransform(actionName: "Resize Layer")
             }
     }
 
@@ -143,25 +225,25 @@ struct SelectionOverlayView: View {
                 let start = dragStartTransform ?? layer.transform
                 if dragStartTransform == nil {
                     dragStartTransform = start
+                    isRotatingHandle = true
+                    model.beginLiveTransform(for: layer.id, isRotating: true)
                 }
                 let center = CGPoint(
                     x: canvasFrame.minX + start.position.x * displayScale,
                     y: canvasFrame.minY + start.position.y * displayScale
                 )
-                let dx = value.location.x - center.x
-                let dy = value.location.y - center.y
-                let angleRad = atan2(dy, dx) + (.pi / 2.0)
-                var degrees = Double(angleRad * 180.0 / .pi)
-                if NSEvent.modifierFlags.contains(.shift) {
-                    degrees = (degrees / 15.0).rounded() * 15.0
-                }
+                let rawDegrees = RotationMath.angleDegrees(from: center, to: value.location)
+                let shiftHeld = NSEvent.modifierFlags.contains(.shift)
+                let finalDegrees = RotationMath.snapDegrees(rawDegrees, increment: 15.0, isShiftPressed: shiftHeld)
+
                 var next = start
-                next.rotationDegrees = degrees
-                model.setLayerTransform(id: layer.id, transform: next, continuous: true, actionName: "Rotate Layer")
+                next.rotationDegrees = finalDegrees
+                model.updateLiveTransform(next, isRotating: true, isShiftSnapped: shiftHeld)
             }
             .onEnded { _ in
                 dragStartTransform = nil
-                model.endContinuousEdit(actionName: "Rotate Layer")
+                isRotatingHandle = false
+                model.endLiveTransform(actionName: "Rotate Layer")
             }
     }
 }

@@ -15,7 +15,6 @@ struct EditorWindowView: View {
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var isInspectorPresented: Bool = true
     @State private var showTray: Bool = true
-    @State private var zoomFactor: CGFloat = 1.0
     @State private var hostWindow: NSWindow?
 
     private let workspace = Workspace.shared
@@ -73,7 +72,6 @@ struct EditorWindowView: View {
             CanvasStageView(
                 model: model,
                 workspace: workspace,
-                zoomFactor: $zoomFactor,
                 showTray: $showTray,
                 onOpenFile: { openImageOrProjectFile(for: model) },
                 onPaste: { pasteFromClipboard(into: model) }
@@ -96,27 +94,30 @@ struct EditorWindowView: View {
 
             ToolbarItemGroup(placement: .principal) {
                 Button {
-                    zoomFactor = max(0.25, zoomFactor / 1.25)
+                    model.zoomOut()
                 } label: {
                     Label("Zoom Out", systemImage: "minus.magnifyingglass")
                 }
-                .help("Zoom Out")
+                .disabled(!model.hasCanvasSurface)
+                .help("Zoom Out (⌘-)")
 
                 Button {
-                    zoomFactor = 1.0
+                    model.zoomToFit()
                 } label: {
-                    Text("\(Int((zoomFactor * 100).rounded()))%")
+                    Text("\(model.viewport.zoomPercentage)%")
                         .font(.caption.monospacedDigit())
-                        .frame(minWidth: 38)
+                        .frame(minWidth: 42)
                 }
-                .help("Zoom to Fit")
+                .disabled(!model.hasCanvasSurface)
+                .help("Zoom to Fit (⌘0)")
 
                 Button {
-                    zoomFactor = min(4.0, zoomFactor * 1.25)
+                    model.zoomIn()
                 } label: {
                     Label("Zoom In", systemImage: "plus.magnifyingglass")
                 }
-                .help("Zoom In")
+                .disabled(!model.hasCanvasSurface)
+                .help("Zoom In (⌘+)")
             }
 
             ToolbarItemGroup(placement: .primaryAction) {
@@ -551,6 +552,27 @@ private struct SingleKeyShortcutBridge: NSViewRepresentable {
             }
 
             let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            if modifiers == .command || modifiers == [.command, .shift] {
+                if let chars = event.charactersIgnoringModifiers?.lowercased(), model.hasCanvasSurface {
+                    switch chars {
+                    case "=", "+":
+                        model.zoomIn()
+                        return nil
+                    case "-":
+                        model.zoomOut()
+                        return nil
+                    case "0" where modifiers == .command:
+                        model.zoomToFit()
+                        return nil
+                    case "1" where modifiers == .command:
+                        model.zoomToActualSize()
+                        return nil
+                    default:
+                        break
+                    }
+                }
+                return event
+            }
             guard modifiers.isEmpty else { return event }
 
             switch event.keyCode {
