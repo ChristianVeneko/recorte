@@ -4,10 +4,14 @@ import RecorteIO
 import SwiftUI
 
 struct EditorWindowView: View {
+    let requestedEditorID: UUID?
+
     @Environment(\.undoManager) private var envUndoManager
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.dismissWindow) private var dismissWindow
 
-    @State private var model: EditorModel
+    @State private var model: EditorModel?
+    @State private var didResolve: Bool
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var isInspectorPresented: Bool = true
     @State private var showTray: Bool = true
@@ -16,11 +20,52 @@ struct EditorWindowView: View {
 
     private let workspace = Workspace.shared
 
-    init(editorID: UUID) {
-        _model = State(initialValue: Workspace.shared.resolveEditor(id: editorID))
+    init(editorID: UUID?) {
+        self.requestedEditorID = editorID
+        if let editorID, let existing = Workspace.shared.editor(id: editorID) {
+            _model = State(initialValue: existing)
+            _didResolve = State(initialValue: true)
+        } else {
+            _model = State(initialValue: nil)
+            _didResolve = State(initialValue: false)
+        }
     }
 
     var body: some View {
+        Group {
+            if let model {
+                editorContent(for: model)
+            } else if didResolve {
+                Color.clear
+                    .frame(width: 1, height: 1)
+                    .background(CloseWindowImmediatelyBridge())
+                    .onAppear {
+                        dismissWindow()
+                    }
+            } else {
+                Color.clear
+                    .frame(minWidth: 800, minHeight: 600)
+                    .onAppear {
+                        resolveEditorOnce()
+                    }
+            }
+        }
+        .handlesExternalEvents(preferring: ["*"], allowing: ["*"])
+    }
+
+    private func resolveEditorOnce() {
+        guard !didResolve else { return }
+        didResolve = true
+        if let requestedEditorID {
+            model = workspace.resolveEditor(id: requestedEditorID)
+        } else {
+            model = workspace.claimOrCreateEditor()
+        }
+    }
+
+    @ViewBuilder
+    private func editorContent(for model: EditorModel) -> some View {
+        @Bindable var bindableModel = model
         NavigationSplitView(columnVisibility: $columnVisibility) {
             LayersSidebarView(model: model)
                 .navigationSplitViewColumnWidth(min: 200, ideal: 230, max: 320)
@@ -30,8 +75,8 @@ struct EditorWindowView: View {
                 workspace: workspace,
                 zoomFactor: $zoomFactor,
                 showTray: $showTray,
-                onOpenFile: openImageOrProjectFile,
-                onPaste: pasteFromClipboard
+                onOpenFile: { openImageOrProjectFile(for: model) },
+                onPaste: { pasteFromClipboard(into: model) }
             )
         }
         .inspector(isPresented: $isInspectorPresented) {
@@ -150,10 +195,10 @@ struct EditorWindowView: View {
                 .help("Toggle Inspector")
             }
         }
-        .sheet(isPresented: $model.isPresentingResizeSheet) {
+        .sheet(isPresented: $bindableModel.isPresentingResizeSheet) {
             ResizeSheetView(model: model)
         }
-        .sheet(isPresented: $model.isPresentingCollageSheet) {
+        .sheet(isPresented: $bindableModel.isPresentingCollageSheet) {
             CollageSheetView(model: model, workspace: workspace)
         }
         .navigationTitle(model.title)
@@ -186,7 +231,7 @@ struct EditorWindowView: View {
         )
     }
 
-    private func pasteFromClipboard() {
+    private func pasteFromClipboard(into model: EditorModel) {
         do {
             try workspace.pasteFromPasteboard(preferredEditor: model)
         } catch {
@@ -194,11 +239,28 @@ struct EditorWindowView: View {
         }
     }
 
-    private func openImageOrProjectFile() {
+    private func openImageOrProjectFile(for model: EditorModel) {
         ExportPanelController.presentOpenPanel(allowProjects: true) { urls in
             _ = workspace.openFiles(at: urls, preferredEditor: model)
         }
     }
+}
+
+private struct CloseWindowImmediatelyBridge: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let view = WindowObserverView()
+        view.onWindowChanged = { window in
+            guard let window else { return }
+            window.alphaValue = 0
+            DispatchQueue.main.async {
+                window.orderOut(nil)
+                window.close()
+            }
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
 }
 
 // MARK: - Native NSWindow Tabbing Coordinator & Bridge (S4)

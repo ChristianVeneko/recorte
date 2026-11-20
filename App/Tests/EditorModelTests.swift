@@ -676,4 +676,87 @@ struct EditorModelTests {
         #expect(window2.tabGroup === window1.tabGroup)
         #expect(window1.tabbedWindows?.contains(window2) == true)
     }
+
+    @Test("External file open while app is running does not create an extra empty Untitled tab")
+    func externalFileOpenSuppressesExtraEmptyTab() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RecorteExternalOpenTest-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let file1 = tempDir.appendingPathComponent("existing.png")
+        let file2 = tempDir.appendingPathComponent("opened.png")
+        try ImageExporter.export(makeSolidImage(width: 160, height: 120, r: 60, g: 130, b: 220), to: file1, format: .png)
+        try ImageExporter.export(makeSolidImage(width: 100, height: 80, r: 220, g: 90, b: 60), to: file2, format: .png)
+
+        let workspace = Workspace()
+        workspace.hasAttachedWindow = true
+        var openedTabIDs: [UUID] = []
+        workspace.onRequestOpenTab = { id in
+            openedTabIDs.append(id)
+        }
+
+        // Plain launch creates one empty Untitled document
+        let initial = workspace.claimOrCreateEditor()
+        #expect(initial != nil)
+        #expect(initial?.title == "Untitled")
+        #expect(workspace.editors.count == 1)
+
+        // Load first document into it
+        try initial?.openFile(from: file1)
+        #expect(initial?.title == "existing")
+
+        // Simulate `open -a Recorte opened.png` while app is already running
+        let openTime = Date()
+        let opened = workspace.openExternalFiles(at: [file2], now: openTime)
+        #expect(opened.count == 1)
+        #expect(opened[0].title == "opened")
+        #expect(workspace.editors.count == 2)
+        #expect(openedTabIDs == [opened[0].id])
+
+        // If SwiftUI attempts to open an implicit default window right after `open -a`,
+        // Workspace must suppress creating an extra empty Untitled tab.
+        let stray = workspace.claimOrCreateEditor(now: openTime.addingTimeInterval(0.05))
+        #expect(stray == nil)
+        #expect(workspace.editors.count == 2)
+        #expect(!workspace.editors.contains(where: { $0.isEmpty }))
+
+        // Explicit Cmd+T / New Tab still works immediately
+        let explicitTab = workspace.openNewTab()
+        #expect(explicitTab.isEmpty)
+        #expect(workspace.editors.count == 3)
+
+        // After the external-open suppression window expires, implicit new tab (e.g. tab bar +) works again
+        let laterTab = workspace.claimOrCreateEditor(now: openTime.addingTimeInterval(2.0))
+        #expect(laterTab != nil)
+        #expect(laterTab?.isEmpty == true)
+        #expect(workspace.editors.count == 4)
+    }
+
+    @Test("Cold launch external file open suppresses any spurious second empty window")
+    func coldLaunchExternalOpenSuppressesSpuriousEmptyWindow() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RecorteColdExternalTest-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let file = tempDir.appendingPathComponent("launch.png")
+        try ImageExporter.export(makeSolidImage(width: 140, height: 100, r: 20, g: 180, b: 140), to: file, format: .png)
+
+        let workspace = Workspace()
+        let openTime = Date()
+        let opened = workspace.openExternalFiles(at: [file], now: openTime)
+        #expect(opened.count == 1)
+
+        // First window claims the opened file
+        let claimed = workspace.claimOrCreateEditor(now: openTime.addingTimeInterval(0.01))
+        #expect(claimed?.id == opened[0].id)
+        #expect(claimed?.title == "launch")
+        #expect(workspace.editors.count == 1)
+
+        // Any spurious second implicit window right after is suppressed
+        let stray = workspace.claimOrCreateEditor(now: openTime.addingTimeInterval(0.05))
+        #expect(stray == nil)
+        #expect(workspace.editors.count == 1)
+    }
 }

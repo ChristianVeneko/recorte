@@ -26,8 +26,6 @@ struct RecorteApp: App {
 
         WindowGroup(id: Self.editorWindowID, for: UUID.self) { $editorID in
             EditorWindowView(editorID: editorID)
-        } defaultValue: {
-            Workspace.shared.claimOrCreateEditorID()
         }
         .handlesExternalEvents(matching: [])
         .commands {
@@ -59,7 +57,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func application(_ application: NSApplication, open urls: [URL]) {
         guard !urls.isEmpty else { return }
-        let opened = Workspace.shared.openFiles(at: urls)
+        let opened = Workspace.shared.openExternalFiles(at: urls)
         NSApp.activate()
         if let firstID = opened.first?.id,
            let window = WindowTabCoordinator.shared.window(for: firstID) {

@@ -23,6 +23,9 @@ public final class Workspace {
     @ObservationIgnored
     private var unclaimedEditorIDs: [UUID] = []
 
+    @ObservationIgnored
+    private var suppressImplicitEmptyEditorUntil: Date?
+
     public init() {}
 
     public var activeEditor: EditorModel? {
@@ -97,15 +100,26 @@ public final class Workspace {
     }
 
     /// Claims the next unclaimed editor (e.g. from cold-launch file open) or creates a new empty Untitled editor.
-    public func claimOrCreateEditorID() -> UUID {
+    /// Returns `nil` when an implicit empty window should be suppressed right after an external file open (`open -a`).
+    public func claimOrCreateEditor(now: Date = Date()) -> EditorModel? {
         while let nextID = unclaimedEditorIDs.first {
             unclaimedEditorIDs.removeFirst()
             if let existing = editor(id: nextID) {
                 activeEditorID = existing.id
-                return existing.id
+                return existing
             }
         }
-        return createEditor().id
+        if !editors.isEmpty,
+           let until = suppressImplicitEmptyEditorUntil,
+           now < until {
+            return nil
+        }
+        return createEditor()
+    }
+
+    /// Claims the next unclaimed editor ID or creates a new empty Untitled editor.
+    public func claimOrCreateEditorID() -> UUID {
+        (claimOrCreateEditor() ?? createEditor()).id
     }
 
     /// Opens tabs for any remaining unclaimed editors (e.g. multiple files passed on cold launch).
@@ -119,6 +133,18 @@ public final class Workspace {
     }
 
     // MARK: - Paste & File Open Routing
+
+    /// Entry point for OS-level external file opens (Finder / `open -a Recorte file.png`).
+    /// Suppresses any stray implicit empty Untitled window SwiftUI may try to open for the same event.
+    @discardableResult
+    public func openExternalFiles(
+        at urls: [URL],
+        now: Date = Date()
+    ) -> [EditorModel] {
+        guard !urls.isEmpty else { return [] }
+        suppressImplicitEmptyEditorUntil = now.addingTimeInterval(0.75)
+        return openFiles(at: urls)
+    }
 
     @discardableResult
     public func pasteImage(
