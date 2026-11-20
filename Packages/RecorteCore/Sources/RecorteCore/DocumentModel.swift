@@ -50,17 +50,21 @@ public struct SendableImage: @unchecked Sendable, Equatable {
     public var filterPreset: FilterPreset
     public var adjustments: Adjustments
     public var frame: ImageFrame
+    /// Optional 8-bit grayscale alpha mask (`255` = visible, `0` = erased) preserving original pixels for restore.
+    public var alphaMask: CGImage?
 
     public init(
         _ cgImage: CGImage,
         filterPreset: FilterPreset = .none,
         adjustments: Adjustments = Adjustments(),
-        frame: ImageFrame = .none
+        frame: ImageFrame = .none,
+        alphaMask: CGImage? = nil
     ) {
         self.cgImage = cgImage
         self.filterPreset = filterPreset
         self.adjustments = adjustments
         self.frame = frame
+        self.alphaMask = alphaMask
     }
 
     public var width: Int { cgImage.width }
@@ -71,7 +75,8 @@ public struct SendableImage: @unchecked Sendable, Equatable {
         lhs.cgImage === rhs.cgImage &&
         lhs.filterPreset == rhs.filterPreset &&
         lhs.adjustments == rhs.adjustments &&
-        lhs.frame == rhs.frame
+        lhs.frame == rhs.frame &&
+        lhs.alphaMask === rhs.alphaMask
     }
 }
 

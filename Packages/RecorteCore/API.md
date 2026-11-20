@@ -5,7 +5,7 @@
 - `EditorDocument` mutating ops: `add(_:)`, `remove(id:)`, `duplicate(id:)`, `reorder(from:to:)`, `move(id:to:)`, `setVisibility(id:isHidden:)`, `setLock(id:isLocked:)`, `setOpacity(id:opacity:)`.
 - `Layer`: `{id: UUID, name, kind: LayerKind, transform: LayerTransform(position, scale, rotation/rotationDegrees), opacity, isHidden, isLocked}`.
 - `LayerKind`: `.image(SendableImage)` | `.text(TextSpec)` | `.shape(ShapeSpec)` | `.sticker(StickerSpec)` | `.drawing(DrawingSpec)`.
-- `SendableImage`: `@unchecked Sendable` wrapper around immutable `CGImage` + `filterPreset: FilterPreset` + `adjustments: Adjustments` + `frame: ImageFrame` (default `.none`).
+- `SendableImage`: `@unchecked Sendable` wrapper around immutable `CGImage` + `filterPreset: FilterPreset` + `adjustments: Adjustments` + `frame: ImageFrame` (default `.none`) + optional `alphaMask: CGImage?` (default `nil`, 8-bit linear grayscale mask preserving original pixels for restore; helpers `applyingEraserStroke(_:)`, `applyingEraserStrokes(_:)`, `maskedCGImage()`).
 - `ImageFrame`: `.none` | `.border(width:color:)` | `.roundedCorners(radius:)` | `.polaroid(caption:borderColor:)` | `.dropShadow(radius:offsetX:offsetY:color:)`.
 - `TextSpec`: `{string, fontName, size, color, alignment: .left|.center|.right, stroke: TextStrokeSpec?, background: RGBAColor?, gradient: TextGradientSpec?, bubble: TextBubbleStyle, bubbleColor: RGBAColor?, bubbleStrokeColor: RGBAColor?, bubbleStrokeWidth: Double}`.
   - `TextGradientSpec`: `{colors: [RGBAColor], angleDegrees: Double}` (0° = left-to-right, 90° = top-to-bottom).
@@ -25,6 +25,11 @@
   - `resize(_:to:keepAspect:) throws -> CGImage` (`CILanczosScaleTransform`)
   - `rotate90(_:direction:) throws -> CGImage` (`RotationDirection`: `.left90 | .right90`)
   - `flip(_:axis:) throws -> CGImage` (`FlipAxis`: `.horizontal | .vertical`)
+- `ImageEraser` & `EraserStroke` / `EraserMode` / `EraserStrokeSession` (S23 manual brush eraser, top-left image pixel coordinates):
+  - `EraserMode`: `.erase | .restore`; `EraserStroke`: `{points: [CGPoint], brushSize: CGFloat, hardness: CGFloat (0..1), mode: EraserMode}`.
+  - `ImageEraser.applyStroke(_:stroke:sourceImage:)`, `applyStrokes(_:strokes:sourceImage:)`, `erase(_:points:brushSize:hardness:)`, `restore(_:from:points:brushSize:hardness:)`.
+  - Non-destructive mask ops: `makeOpaqueMask(width:height:)`, `applyStrokeToMask(_:width:height:stroke:)`, `applyAlphaMask(_:to:)`, `interpolatePoints(_:spacing:)`.
+  - `EraserStrokeSession`: incremental live drag rasterizer (`init(baseMask:width:height:brushSize:hardness:mode:)`, `appendPoint(_:)`, `finish()`, `currentMaskImage()`).
 - `RecorteProject` & `RecorteProjectManifest` (Codable `.recorte` package format + PDF export):
   - `RecorteProject.save(_:to:) throws`, `RecorteProject.load(from:) throws -> EditorDocument`, `RecorteProject.loadProject(from:) throws -> RecorteProject` (writes `document.json` + lossless PNG per image layer under `assets/`).
   - `RecorteProject.exportPDFData(_:scale:) throws -> Data`, `RecorteProject.exportPDF(_:to:scale:) throws`.

@@ -36,6 +36,8 @@ public struct SerializedLayer: Sendable, Equatable, Codable {
     public var opacity: Double
     public var isHidden: Bool
     public var isLocked: Bool
+    /// Optional relative path to an 8-bit grayscale alpha mask PNG inside `assets/`.
+    public var alphaMaskPath: String?
 
     public init(
         id: UUID,
@@ -44,7 +46,8 @@ public struct SerializedLayer: Sendable, Equatable, Codable {
         transform: LayerTransform,
         opacity: Double,
         isHidden: Bool,
-        isLocked: Bool
+        isLocked: Bool,
+        alphaMaskPath: String? = nil
     ) {
         self.id = id
         self.name = name
@@ -53,6 +56,23 @@ public struct SerializedLayer: Sendable, Equatable, Codable {
         self.opacity = opacity
         self.isHidden = isHidden
         self.isLocked = isLocked
+        self.alphaMaskPath = alphaMaskPath
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, kind, transform, opacity, isHidden, isLocked, alphaMaskPath
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try c.decode(UUID.self, forKey: .id)
+        self.name = try c.decode(String.self, forKey: .name)
+        self.kind = try c.decode(SerializedLayerKind.self, forKey: .kind)
+        self.transform = try c.decode(LayerTransform.self, forKey: .transform)
+        self.opacity = try c.decode(Double.self, forKey: .opacity)
+        self.isHidden = try c.decode(Bool.self, forKey: .isHidden)
+        self.isLocked = try c.decode(Bool.self, forKey: .isLocked)
+        self.alphaMaskPath = try c.decodeIfPresent(String.self, forKey: .alphaMaskPath)
     }
 }
 
@@ -119,6 +139,7 @@ public struct RecorteProject: Sendable, Equatable {
 
         for layer in document.layers {
             let serializedKind: SerializedLayerKind
+            var maskRelativePath: String? = nil
             switch layer.kind {
             case .image(let sendableImg):
                 let filename = "\(layer.id.uuidString).png"
@@ -126,6 +147,13 @@ public struct RecorteProject: Sendable, Equatable {
                 let assetURL = assetsDir.appendingPathComponent(filename)
                 try writePNG(sendableImg.cgImage, to: assetURL)
                 writtenAssetFilenames.insert(filename)
+                if let mask = sendableImg.alphaMask {
+                    let maskFilename = "\(layer.id.uuidString)-mask.png"
+                    let maskURL = assetsDir.appendingPathComponent(maskFilename)
+                    try writePNG(mask, to: maskURL)
+                    writtenAssetFilenames.insert(maskFilename)
+                    maskRelativePath = "\(assetsDirectoryName)/\(maskFilename)"
+                }
                 serializedKind = .image(
                     assetPath: relativePath,
                     filterPreset: sendableImg.filterPreset,
@@ -149,7 +177,8 @@ public struct RecorteProject: Sendable, Equatable {
                 transform: layer.transform,
                 opacity: layer.opacity,
                 isHidden: layer.isHidden,
-                isLocked: layer.isLocked
+                isLocked: layer.isLocked,
+                alphaMaskPath: maskRelativePath
             ))
         }
 
@@ -211,11 +240,20 @@ public struct RecorteProject: Sendable, Equatable {
                     throw RecorteProjectError.missingAsset(assetPath)
                 }
                 let cgImage = try readPNG(from: assetURL)
+                var loadedMask: CGImage? = nil
+                if let maskPath = serialized.alphaMaskPath {
+                    let maskURL = url.appendingPathComponent(maskPath)
+                    guard fm.fileExists(atPath: maskURL.path) else {
+                        throw RecorteProjectError.missingAsset(maskPath)
+                    }
+                    loadedMask = try readPNG(from: maskURL)
+                }
                 kind = .image(SendableImage(
                     cgImage,
                     filterPreset: filterPreset,
                     adjustments: adjustments,
-                    frame: frame
+                    frame: frame,
+                    alphaMask: loadedMask
                 ))
             case .text(let spec):
                 kind = .text(spec)

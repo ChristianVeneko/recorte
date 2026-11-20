@@ -1,6 +1,7 @@
 import Foundation
 import CoreGraphics
 import CoreText
+import AppKit
 
 public enum RenderError: Error, Sendable, Equatable {
     case invalidCanvasSize
@@ -105,15 +106,22 @@ public enum Renderer {
     // MARK: - Image Layer
 
     private static func drawImageLayer(_ sendableImg: SendableImage, in ctx: CGContext, renderScale: CGFloat) {
-        let imgToDraw: CGImage
+        let filteredImage: CGImage
         if sendableImg.filterPreset != .none || !sendableImg.adjustments.isIdentity {
-            imgToDraw = (try? ImageFilters.apply(
+            filteredImage = (try? ImageFilters.apply(
                 to: sendableImg.cgImage,
                 preset: sendableImg.filterPreset,
                 adjustments: sendableImg.adjustments
             )) ?? sendableImg.cgImage
         } else {
-            imgToDraw = sendableImg.cgImage
+            filteredImage = sendableImg.cgImage
+        }
+
+        let imgToDraw: CGImage
+        if let mask = sendableImg.alphaMask {
+            imgToDraw = (try? ImageEraser.applyAlphaMask(mask, to: filteredImage)) ?? filteredImage
+        } else {
+            imgToDraw = filteredImage
         }
 
         let w = CGFloat(imgToDraw.width)
@@ -615,7 +623,8 @@ public enum Renderer {
         case .emoji(let emoji):
             text = emoji
         case .sfSymbol(let symbolName):
-            text = symbolName
+            drawSymbolSticker(symbolName, spec: spec, in: ctx)
+            return
         }
 
         let textSpec = TextSpec(
@@ -625,6 +634,21 @@ public enum Renderer {
             color: spec.tintColor
         )
         drawTextLayer(textSpec, in: ctx)
+    }
+
+    /// Draws an SF Symbol tinted with the sticker color, centered on the layer origin.
+    private static func drawSymbolSticker(_ name: String, spec: StickerSpec, in ctx: CGContext) {
+        let tint = NSColor(srgbRed: spec.tintColor.r, green: spec.tintColor.g, blue: spec.tintColor.b, alpha: spec.tintColor.a)
+        let config = NSImage.SymbolConfiguration(pointSize: CGFloat(spec.pointSize), weight: .regular)
+            .applying(NSImage.SymbolConfiguration(paletteColors: [tint]))
+        guard let symbol = NSImage(systemSymbolName: name, accessibilityDescription: nil)?.withSymbolConfiguration(config) else { return }
+        var rect = CGRect(origin: .zero, size: symbol.size)
+        guard let image = symbol.cgImage(forProposedRect: &rect, context: nil, hints: nil) else { return }
+        let w = symbol.size.width, h = symbol.size.height
+        ctx.saveGState()
+        ctx.scaleBy(x: 1.0, y: -1.0)  // context is top-left; CGImage draws bottom-up
+        ctx.draw(image, in: CGRect(x: -w / 2.0, y: -h / 2.0, width: w, height: h))
+        ctx.restoreGState()
     }
 
     // MARK: - Drawing Layer
